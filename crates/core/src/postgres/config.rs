@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// `Keychain` defers credential lookup to the macOS keychain at connect time;
 /// this matches the SSH/SFTP pattern and keeps secrets out of memory until
 /// they are actually required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum PgAuthMethod {
     /// Plaintext password supplied directly. Use only for ephemeral test
     /// connections; production callers should prefer `Keychain`.
@@ -19,6 +19,21 @@ pub enum PgAuthMethod {
     /// Resolve the password from the macOS keychain at connect time, using
     /// the supplied `account` identifier (e.g. `"postgres:profile-id"`).
     Keychain { account: String },
+}
+
+impl std::fmt::Debug for PgAuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PgAuthMethod::Password { .. } => f
+                .debug_struct("PgAuthMethod::Password")
+                .field("password", &"<redacted>")
+                .finish(),
+            PgAuthMethod::Keychain { account } => f
+                .debug_struct("PgAuthMethod::Keychain")
+                .field("account", account)
+                .finish(),
+        }
+    }
 }
 
 /// TLS posture for the connection.
@@ -178,5 +193,27 @@ mod tests {
         assert_eq!(cfg.max_pool_size, None);
         assert_eq!(cfg.idle_timeout_secs, None);
         assert_eq!(cfg.min_idle_connections, None);
+    }
+
+    #[test]
+    fn debug_redacts_direct_password() {
+        let cfg = PgConfig {
+            auth: PgAuthMethod::Password {
+                password: "super-secret-pg-password".to_string(),
+            },
+            ..PgConfig::local("db", "u")
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("super-secret-pg-password"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn debug_preserves_keychain_account() {
+        let auth = PgAuthMethod::Keychain {
+            account: "postgres:profile-1".to_string(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("postgres:profile-1"));
     }
 }

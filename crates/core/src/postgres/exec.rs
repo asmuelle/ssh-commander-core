@@ -95,72 +95,9 @@ pub struct PageResult {
 /// `…';' …` inside a quote we mis-tracked — extremely rare and the
 /// fallback (lose column types, no cursor pagination) is non-fatal.
 pub(crate) fn is_multi_statement(sql: &str) -> bool {
-    enum LexState {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        LineComment,
-        BlockComment,
-    }
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut state = LexState::Normal;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match state {
-            LexState::Normal => match c {
-                b'\'' => state = LexState::SingleQuote,
-                b'"' => state = LexState::DoubleQuote,
-                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                    state = LexState::LineComment;
-                    i += 1;
-                }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                    state = LexState::BlockComment;
-                    i += 1;
-                }
-                b';' => {
-                    let rest = &bytes[i + 1..];
-                    if rest.iter().any(|b| !b.is_ascii_whitespace()) {
-                        return true;
-                    }
-                    return false;
-                }
-                _ => {}
-            },
-            LexState::SingleQuote => {
-                if c == b'\'' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        i += 1; // doubled quote, escaped
-                    } else {
-                        state = LexState::Normal;
-                    }
-                }
-            }
-            LexState::DoubleQuote => {
-                if c == b'"' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                        i += 1; // doubled quote, escaped
-                    } else {
-                        state = LexState::Normal;
-                    }
-                }
-            }
-            LexState::LineComment => {
-                if c == b'\n' {
-                    state = LexState::Normal;
-                }
-            }
-            LexState::BlockComment => {
-                if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    state = LexState::Normal;
-                    i += 1;
-                }
-            }
-        }
-        i += 1;
-    }
-    false
+    top_level_semicolons(sql)
+        .into_iter()
+        .any(|idx| !is_effectively_empty(&sql[idx + 1..]))
 }
 
 /// Split a multi-statement script into `(preamble, main)` where
@@ -174,68 +111,7 @@ pub(crate) fn is_multi_statement(sql: &str) -> bool {
 /// then run `main` through the cursor path so pagination works on
 /// the SELECT that the user actually cares about.
 pub(crate) fn split_at_last_statement(sql: &str) -> Option<(&str, &str)> {
-    enum LexState {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        LineComment,
-        BlockComment,
-    }
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut state = LexState::Normal;
-    let mut last_delim: Option<usize> = None;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match state {
-            LexState::Normal => match c {
-                b'\'' => state = LexState::SingleQuote,
-                b'"' => state = LexState::DoubleQuote,
-                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                    state = LexState::LineComment;
-                    i += 1;
-                }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                    state = LexState::BlockComment;
-                    i += 1;
-                }
-                b';' => last_delim = Some(i),
-                _ => {}
-            },
-            LexState::SingleQuote => {
-                if c == b'\'' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        i += 1;
-                    } else {
-                        state = LexState::Normal;
-                    }
-                }
-            }
-            LexState::DoubleQuote => {
-                if c == b'"' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                        i += 1;
-                    } else {
-                        state = LexState::Normal;
-                    }
-                }
-            }
-            LexState::LineComment => {
-                if c == b'\n' {
-                    state = LexState::Normal;
-                }
-            }
-            LexState::BlockComment => {
-                if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    state = LexState::Normal;
-                    i += 1;
-                }
-            }
-        }
-        i += 1;
-    }
-
-    let split = last_delim?;
+    let split = top_level_semicolons(sql).into_iter().last()?;
     let main = &sql[split + 1..];
     if is_effectively_empty(main) {
         // Trailing semicolon with nothing real after — possibly just
@@ -252,6 +128,107 @@ pub(crate) fn split_at_last_statement(sql: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((preamble, main))
+}
+
+fn top_level_semicolons(sql: &str) -> Vec<usize> {
+    enum LexState<'a> {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        LineComment,
+        BlockComment,
+        DollarQuote(&'a str),
+    }
+
+    let bytes = sql.as_bytes();
+    let mut positions = Vec::new();
+    let mut i = 0usize;
+    let mut state = LexState::Normal;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match state {
+            LexState::Normal => match c {
+                b'\'' => state = LexState::SingleQuote,
+                b'"' => state = LexState::DoubleQuote,
+                b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                    state = LexState::LineComment;
+                    i += 1;
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    state = LexState::BlockComment;
+                    i += 1;
+                }
+                b'$' => {
+                    if let Some(delimiter) = dollar_quote_delimiter_at(sql, i) {
+                        state = LexState::DollarQuote(delimiter);
+                        i += delimiter.len() - 1;
+                    }
+                }
+                b';' => positions.push(i),
+                _ => {}
+            },
+            LexState::SingleQuote => {
+                if c == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 1;
+                    } else {
+                        state = LexState::Normal;
+                    }
+                }
+            }
+            LexState::DoubleQuote => {
+                if c == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 1;
+                    } else {
+                        state = LexState::Normal;
+                    }
+                }
+            }
+            LexState::LineComment => {
+                if c == b'\n' {
+                    state = LexState::Normal;
+                }
+            }
+            LexState::BlockComment => {
+                if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    state = LexState::Normal;
+                    i += 1;
+                }
+            }
+            LexState::DollarQuote(delimiter) => {
+                if sql[i..].starts_with(delimiter) {
+                    state = LexState::Normal;
+                    i += delimiter.len() - 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    positions
+}
+
+fn dollar_quote_delimiter_at(sql: &str, start: usize) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    let mut end = start + 1;
+    match bytes.get(end) {
+        Some(b'$') => return Some(&sql[start..=end]),
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' => end += 1,
+        _ => return None,
+    }
+    while let Some(b) = bytes.get(end)
+        && (b.is_ascii_alphanumeric() || *b == b'_')
+    {
+        end += 1;
+    }
+    if bytes.get(end) == Some(&b'$') {
+        Some(&sql[start..=end])
+    } else {
+        None
+    }
 }
 
 /// Whether `sql` is whitespace + comments only — i.e. has no real
@@ -662,8 +639,16 @@ mod tests {
         // Block comments.
         assert!(!is_multi_statement("SELECT 1 /* ; */ FROM t"));
         assert!(!is_multi_statement("/* ; */ SELECT 1"));
+        assert!(!is_multi_statement("SELECT 1; -- trailing comment\n"));
         // Real split despite earlier in-comment semicolon.
         assert!(is_multi_statement("SELECT 1 -- ;\n; SELECT 2"));
+    }
+
+    #[test]
+    fn multi_statement_detector_ignores_semicolons_in_dollar_quotes() {
+        assert!(!is_multi_statement("SELECT $$hello; world$$"));
+        assert!(!is_multi_statement("SELECT $tag$hello; world$tag$"));
+        assert!(is_multi_statement("SELECT $$hello; world$$; SELECT 1"));
     }
 
     #[test]
@@ -695,6 +680,22 @@ mod tests {
         let (pre, main) = split_at_last_statement("SET x = 'a;b'; SELECT 1").expect("split");
         assert_eq!(pre, "SET x = 'a;b';");
         assert_eq!(main, "SELECT 1");
+    }
+
+    #[test]
+    fn smart_split_ignores_dollar_quoted_semicolons() {
+        let (pre, main) =
+            split_at_last_statement("SELECT $body$a;b$body$; SELECT 1").expect("split");
+        assert_eq!(pre, "SELECT $body$a;b$body$;");
+        assert_eq!(main, "SELECT 1");
+
+        let function = "CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql; SELECT f()";
+        let (pre, main) = split_at_last_statement(function).expect("split");
+        assert_eq!(
+            pre,
+            "CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql;"
+        );
+        assert_eq!(main, "SELECT f()");
     }
 
     #[test]

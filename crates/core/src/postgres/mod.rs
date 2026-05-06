@@ -47,7 +47,7 @@ pub use introspect::{
 pub use tunnel::SshTunnel;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use rustls::ClientConfig as RustlsClientConfig;
@@ -153,7 +153,7 @@ pub struct PgPool {
     /// one needs its own connection. Keyed by database name.
     /// Lazily populated on first cross-database introspection;
     /// torn down by `shutdown`.
-    secondary_browsers: Mutex<HashMap<String, Arc<Mutex<PooledConnection>>>>,
+    secondary_browsers: Mutex<HashMap<String, SecondaryBrowserEntry>>,
     /// Signal to the background eviction task that it should stop.
     /// `shutdown` cancels it explicitly; the task also self-exits
     /// when the pool's `Weak<Self>` upgrade fails (i.e. all `Arc`s
@@ -167,7 +167,15 @@ pub struct PgPool {
 /// doesn't immediately evict.
 struct IdleEntry {
     since: Instant,
-    conn: Arc<Mutex<PooledConnection>>,
+    conn: Arc<PooledConnection>,
+}
+
+/// A cross-database browser connection plus its last-use timestamp.
+/// These entries are counted against the same pool limit as ordinary
+/// idle/leased connections and are aged out by the eviction loop.
+struct SecondaryBrowserEntry {
+    since: Instant,
+    conn: Arc<PooledConnection>,
 }
 
 /// Erased TLS strategy for both data connections and cancel
@@ -186,7 +194,7 @@ struct PoolInner {
     /// `EVICTION_INTERVAL`.
     idle: Vec<IdleEntry>,
     /// Active leases, keyed by caller-supplied session id.
-    leased: HashMap<String, Arc<Mutex<PooledConnection>>>,
+    leased: HashMap<String, Arc<PooledConnection>>,
     /// Total connections in existence (idle + leased + currently
     /// being opened). Bounds growth against `max_size`.
     total: usize,
@@ -195,13 +203,31 @@ struct PoolInner {
 struct PooledConnection {
     client: Client,
     cancel_token: CancelToken,
+    /// Serializes normal SQL work on this wire. The cancel path never
+    /// takes this lock; it only needs `cancel_token`, which is immutable.
+    operation_lock: Mutex<()>,
     /// At-most-one active cursor on this wire. Protected by the
-    /// per-connection mutex (callers hold it for the duration of
-    /// any cursor op).
-    active_cursor: Option<ActiveCursor>,
+    /// operation lock plus this small metadata mutex.
+    active_cursor: Mutex<Option<ActiveCursor>>,
     /// Background task that drives this connection's wire protocol.
     /// Aborted when the connection is dropped from the pool.
-    connection_task: Option<JoinHandle<()>>,
+    connection_task: StdMutex<Option<JoinHandle<()>>>,
+}
+
+impl PooledConnection {
+    fn abort_connection_task(&self) {
+        if let Ok(mut task) = self.connection_task.lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        self.abort_connection_task();
+    }
 }
 
 impl PgPool {
@@ -262,7 +288,7 @@ impl PgPool {
             inner: Mutex::new(PoolInner {
                 idle: vec![IdleEntry {
                     since: now,
-                    conn: Arc::new(Mutex::new(first)),
+                    conn: Arc::new(first),
                 }],
                 leased: HashMap::new(),
                 total: 1,
@@ -295,8 +321,8 @@ impl PgPool {
     /// refresh.
     pub async fn list_databases(&self) -> Result<Vec<DbSummary>, PgError> {
         let conn = self.lease_for_session(BROWSER_SESSION_ID).await?;
-        let guard = conn.lock().await;
-        Ok(introspect::list_databases(&guard.client).await?)
+        let _operation = conn.operation_lock.lock().await;
+        Ok(introspect::list_databases(&conn.client).await?)
     }
 
     pub async fn list_schemas(&self) -> Result<Vec<SchemaSummary>, PgError> {
@@ -314,8 +340,8 @@ impl PgPool {
         database: Option<&str>,
     ) -> Result<Vec<SchemaSummary>, PgError> {
         let conn = self.browser_connection_for(database).await?;
-        let guard = conn.lock().await;
-        Ok(introspect::list_schemas(&guard.client).await?)
+        let _operation = conn.operation_lock.lock().await;
+        Ok(introspect::list_schemas(&conn.client).await?)
     }
 
     pub async fn list_relations(&self, schema: &str) -> Result<Vec<Relation>, PgError> {
@@ -328,8 +354,8 @@ impl PgPool {
         database: Option<&str>,
     ) -> Result<Vec<Relation>, PgError> {
         let conn = self.browser_connection_for(database).await?;
-        let guard = conn.lock().await;
-        Ok(introspect::list_relations(&guard.client, schema).await?)
+        let _operation = conn.operation_lock.lock().await;
+        Ok(introspect::list_relations(&conn.client, schema).await?)
     }
 
     /// Unified schema-contents fetch — tables, views, mat-views,
@@ -342,8 +368,8 @@ impl PgPool {
         database: Option<&str>,
     ) -> Result<SchemaContents, PgError> {
         let conn = self.browser_connection_for(database).await?;
-        let guard = conn.lock().await;
-        Ok(introspect::list_schema_contents(&guard.client, schema).await?)
+        let _operation = conn.operation_lock.lock().await;
+        Ok(introspect::list_schema_contents(&conn.client, schema).await?)
     }
 
     /// Resolve a browser connection for `database`. When `None` or
@@ -353,33 +379,53 @@ impl PgPool {
     async fn browser_connection_for(
         &self,
         database: Option<&str>,
-    ) -> Result<Arc<Mutex<PooledConnection>>, PgError> {
+    ) -> Result<Arc<PooledConnection>, PgError> {
         let target = database.unwrap_or(self.config.database.as_str());
         if target == self.config.database {
             return self.lease_for_session(BROWSER_SESSION_ID).await;
         }
         // Cached secondary?
         {
-            let map = self.secondary_browsers.lock().await;
-            if let Some(c) = map.get(target) {
-                return Ok(c.clone());
+            let mut map = self.secondary_browsers.lock().await;
+            if let Some(entry) = map.get_mut(target) {
+                entry.since = Instant::now();
+                return Ok(entry.conn.clone());
             }
         }
+        self.reserve_connection_slot().await?;
+
         // Open a fresh connection bound to the target database.
         // Reuse credentials, TLS posture, and tunnel — only the
         // database name differs.
         let mut cfg = self.config.clone();
         cfg.database = target.to_string();
-        let conn = open_one(&cfg, self.tunnel.as_deref(), &self.tls_connector).await?;
-        let arc = Arc::new(Mutex::new(conn));
+        let conn = match open_one(&cfg, self.tunnel.as_deref(), &self.tls_connector).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                self.release_connection_slot().await;
+                return Err(e);
+            }
+        };
+        let arc = Arc::new(conn);
         let mut map = self.secondary_browsers.lock().await;
         // Race: another task may have inserted while we were
         // opening. Prefer the existing entry to avoid leaking the
-        // freshly-opened one — drop ours, return theirs.
-        if let Some(existing) = map.get(target) {
-            return Ok(existing.clone());
+        // freshly-opened one — drop ours, return theirs and release
+        // the slot reserved for the duplicate connection.
+        if let Some(existing) = map.get_mut(target) {
+            existing.since = Instant::now();
+            let existing = existing.conn.clone();
+            drop(map);
+            self.release_connection_slot().await;
+            return Ok(existing);
         }
-        map.insert(target.to_string(), arc.clone());
+        map.insert(
+            target.to_string(),
+            SecondaryBrowserEntry {
+                since: Instant::now(),
+                conn: arc.clone(),
+            },
+        );
         Ok(arc)
     }
 
@@ -391,8 +437,8 @@ impl PgPool {
         table: &str,
     ) -> Result<Vec<ColumnDetail>, PgError> {
         let conn = self.lease_for_session(BROWSER_SESSION_ID).await?;
-        let guard = conn.lock().await;
-        Ok(introspect::describe_columns(&guard.client, schema, table).await?)
+        let _operation = conn.operation_lock.lock().await;
+        Ok(introspect::describe_columns(&conn.client, schema, table).await?)
     }
 
     /// Run a SQL statement on the connection assigned to `session_id`,
@@ -406,11 +452,11 @@ impl PgPool {
         page_size: usize,
     ) -> Result<ExecutionOutcome, PgError> {
         let conn = self.lease_for_session(session_id).await?;
-        let mut guard = conn.lock().await;
-        let previous = guard.active_cursor.take();
+        let _operation = conn.operation_lock.lock().await;
+        let previous = conn.active_cursor.lock().await.take();
         let (outcome, new_cursor) =
-            exec::open_query(&guard.client, sql, page_size, previous).await?;
-        guard.active_cursor = new_cursor;
+            exec::open_query(&conn.client, sql, page_size, previous).await?;
+        *conn.active_cursor.lock().await = new_cursor;
         // If the cursor closed (no more rows), the connection is
         // logically idle — but we keep the lease so the same session
         // continues to land on the same wire for follow-up commands
@@ -429,8 +475,8 @@ impl PgPool {
             .leased_only(session_id)
             .await
             .ok_or_else(|| PgError::CursorExpired(format!("no active session {session_id}")))?;
-        let guard = conn.lock().await;
-        let Some(cursor) = guard.active_cursor.as_ref() else {
+        let _operation = conn.operation_lock.lock().await;
+        let Some(cursor) = conn.active_cursor.lock().await.clone() else {
             return Err(PgError::CursorExpired(format!(
                 "session {session_id} has no active cursor"
             )));
@@ -441,9 +487,7 @@ impl PgPool {
                 cursor.cursor_id
             )));
         }
-        let cursor_clone = cursor.clone();
-        let client = &guard.client;
-        exec::fetch_page(client, &cursor_clone, count).await
+        exec::fetch_page(&conn.client, &cursor, count).await
     }
 
     /// Update a single cell on `(schema, table)` identified by ctid.
@@ -463,9 +507,9 @@ impl PgPool {
         ctid: &str,
     ) -> Result<UpdateOutcome, PgError> {
         let conn = self.lease_for_session(session_id).await?;
-        let guard = conn.lock().await;
+        let _operation = conn.operation_lock.lock().await;
         edit::update_cell(
-            &guard.client,
+            &conn.client,
             schema,
             table,
             column,
@@ -489,8 +533,8 @@ impl PgPool {
         return_columns: &[String],
     ) -> Result<InsertedRow, PgError> {
         let conn = self.lease_for_session(session_id).await?;
-        let guard = conn.lock().await;
-        edit::insert_row(&guard.client, schema, table, inputs, return_columns).await
+        let _operation = conn.operation_lock.lock().await;
+        edit::insert_row(&conn.client, schema, table, inputs, return_columns).await
     }
 
     /// Delete one or more rows by ctid on the session's connection.
@@ -505,21 +549,24 @@ impl PgPool {
         ctids: &[String],
     ) -> Result<UpdateOutcome, PgError> {
         let conn = self.lease_for_session(session_id).await?;
-        let guard = conn.lock().await;
-        edit::delete_rows(&guard.client, schema, table, ctids).await
+        let _operation = conn.operation_lock.lock().await;
+        edit::delete_rows(&conn.client, schema, table, ctids).await
     }
 
     pub async fn close_query(&self, session_id: &str, cursor_id: &str) -> Result<(), PgError> {
         let Some(conn) = self.leased_only(session_id).await else {
             return Ok(()); // Nothing to close — idempotent.
         };
-        let mut guard = conn.lock().await;
-        if let Some(c) = guard.active_cursor.as_ref()
-            && c.cursor_id == cursor_id
-        {
-            let cursor = guard.active_cursor.take().expect("just checked");
-            let client = &guard.client;
-            exec::close_query(client, &cursor).await;
+        let _operation = conn.operation_lock.lock().await;
+        let cursor = {
+            let mut active = conn.active_cursor.lock().await;
+            match active.as_ref() {
+                Some(c) if c.cursor_id == cursor_id => active.take(),
+                _ => None,
+            }
+        };
+        if let Some(cursor) = cursor {
+            exec::close_query(&conn.client, &cursor).await;
         }
         Ok(())
     }
@@ -534,10 +581,7 @@ impl PgPool {
         let Some(conn) = self.leased_only(session_id).await else {
             return Ok(());
         };
-        let token = {
-            let guard = conn.lock().await;
-            guard.cancel_token.clone()
-        };
+        let token = conn.cancel_token.clone();
         match &self.tls_connector {
             TlsConnectorKind::NoTls => token.cancel_query(tokio_postgres::NoTls).await,
             TlsConnectorKind::Rustls(connector) => token.cancel_query(connector.clone()).await,
@@ -554,9 +598,10 @@ impl PgPool {
         // Close any open cursor + transaction so the connection is
         // safe to hand to a different session.
         {
-            let mut guard = conn.lock().await;
-            if let Some(cursor) = guard.active_cursor.take() {
-                exec::close_query(&guard.client, &cursor).await;
+            let _operation = conn.operation_lock.lock().await;
+            let cursor = conn.active_cursor.lock().await.take();
+            if let Some(cursor) = cursor {
+                exec::close_query(&conn.client, &cursor).await;
             }
         }
         // Return to idle, stamping the moment of release so the
@@ -575,27 +620,23 @@ impl PgPool {
         self.eviction_cancel.cancel();
 
         let mut inner = self.inner.lock().await;
-        let mut conns: Vec<Arc<Mutex<PooledConnection>>> =
-            inner.idle.drain(..).map(|e| e.conn).collect();
+        let mut conns: Vec<Arc<PooledConnection>> = inner.idle.drain(..).map(|e| e.conn).collect();
         conns.extend(inner.leased.drain().map(|(_, c)| c));
         inner.total = 0;
         drop(inner);
         // Also close any secondary cross-database browser
         // connections we opened.
-        let secondaries: Vec<Arc<Mutex<PooledConnection>>> = {
+        let secondaries: Vec<Arc<PooledConnection>> = {
             let mut map = self.secondary_browsers.lock().await;
-            map.drain().map(|(_, c)| c).collect()
+            map.drain().map(|(_, entry)| entry.conn).collect()
         };
         let conns_with_secondaries = conns.into_iter().chain(secondaries);
-        let conns: Vec<Arc<Mutex<PooledConnection>>> = conns_with_secondaries.collect();
+        let conns: Vec<Arc<PooledConnection>> = conns_with_secondaries.collect();
         for conn in conns {
             // Best-effort task abort; the wire closes when `Client`
             // is dropped (which happens when the last Arc to this
             // PooledConnection drops — usually right here).
-            let mut guard = conn.lock().await;
-            if let Some(task) = guard.connection_task.take() {
-                task.abort();
-            }
+            conn.abort_connection_task();
         }
     }
 
@@ -605,10 +646,7 @@ impl PgPool {
 
     /// Get the connection currently leased to `session_id`, opening
     /// a new one (and leasing it) when the session is new.
-    async fn lease_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<Arc<Mutex<PooledConnection>>, PgError> {
+    async fn lease_for_session(&self, session_id: &str) -> Result<Arc<PooledConnection>, PgError> {
         // Fast path: existing lease.
         {
             let inner = self.inner.lock().await;
@@ -659,16 +697,30 @@ impl PgPool {
                         return Err(e);
                     }
                 };
-            let conn = Arc::new(Mutex::new(new_conn));
+            let conn = Arc::new(new_conn);
             self.assign_lease(session_id, conn.clone()).await;
             return Ok(conn);
         }
         unreachable!()
     }
 
-    async fn assign_lease(&self, session_id: &str, conn: Arc<Mutex<PooledConnection>>) {
+    async fn assign_lease(&self, session_id: &str, conn: Arc<PooledConnection>) {
         let mut inner = self.inner.lock().await;
         inner.leased.insert(session_id.to_string(), conn);
+    }
+
+    async fn reserve_connection_slot(&self) -> Result<(), PgError> {
+        let mut inner = self.inner.lock().await;
+        if inner.total >= self.max_size {
+            return Err(PgError::PoolExhausted(inner.total, self.max_size));
+        }
+        inner.total += 1;
+        Ok(())
+    }
+
+    async fn release_connection_slot(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.total = inner.total.saturating_sub(1);
     }
 
     /// Evict idle connections older than the pool's configured
@@ -676,7 +728,7 @@ impl PgPool {
     /// the background eviction task; safe to call manually too.
     async fn evict_idle(&self) {
         let now = Instant::now();
-        let to_drop: Vec<Arc<Mutex<PooledConnection>>>;
+        let to_drop: Vec<Arc<PooledConnection>>;
         {
             let mut inner = self.inner.lock().await;
             // Take the idle list out so we can decide which entries
@@ -687,7 +739,7 @@ impl PgPool {
             // regardless of age.
             let snapshot = std::mem::take(&mut inner.idle);
             let mut keep: Vec<IdleEntry> = Vec::with_capacity(snapshot.len());
-            let mut drop_list: Vec<Arc<Mutex<PooledConnection>>> = Vec::new();
+            let mut drop_list: Vec<Arc<PooledConnection>> = Vec::new();
             for entry in snapshot.into_iter() {
                 let aged = now.duration_since(entry.since) >= self.idle_timeout;
                 if !aged || keep.len() < self.min_idle {
@@ -714,21 +766,68 @@ impl PgPool {
         // the last reference goes — which is here, since `idle`
         // held the only one.
         for conn in to_drop {
-            let mut guard = conn.lock().await;
-            if let Some(task) = guard.connection_task.take() {
-                task.abort();
+            conn.abort_connection_task();
+        }
+
+        self.evict_secondary_browsers(now).await;
+    }
+
+    async fn evict_secondary_browsers(&self, now: Instant) {
+        let to_drop: Vec<Arc<PooledConnection>> = {
+            let mut map = self.secondary_browsers.lock().await;
+            let drop_keys = map
+                .iter()
+                .filter_map(|(database, entry)| {
+                    let aged = now.duration_since(entry.since) >= self.idle_timeout;
+                    // The map's Arc is the only strong reference when no
+                    // browser operation is currently using this connection.
+                    if aged && Arc::strong_count(&entry.conn) == 1 {
+                        Some(database.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut dropped = Vec::with_capacity(drop_keys.len());
+            for database in drop_keys {
+                if let Some(entry) = map.remove(&database) {
+                    dropped.push(entry.conn);
+                }
             }
+            dropped
+        };
+
+        if to_drop.is_empty() {
+            return;
+        }
+
+        {
+            let mut inner = self.inner.lock().await;
+            for _ in &to_drop {
+                inner.total = inner.total.saturating_sub(1);
+            }
+        }
+
+        tracing::debug!(
+            target: "postgres::pool",
+            count = to_drop.len(),
+            "evicted secondary postgres browser connections"
+        );
+
+        for conn in to_drop {
+            conn.abort_connection_task();
         }
     }
 
     /// Look up the lease for `session_id` without opening a new one.
-    async fn leased_only(&self, session_id: &str) -> Option<Arc<Mutex<PooledConnection>>> {
+    async fn leased_only(&self, session_id: &str) -> Option<Arc<PooledConnection>> {
         let inner = self.inner.lock().await;
         inner.leased.get(session_id).cloned()
     }
 
     /// Remove and return the lease for `session_id`.
-    async fn take_lease(&self, session_id: &str) -> Option<Arc<Mutex<PooledConnection>>> {
+    async fn take_lease(&self, session_id: &str) -> Option<Arc<PooledConnection>> {
         let mut inner = self.inner.lock().await;
         inner.leased.remove(session_id)
     }
@@ -744,25 +843,17 @@ impl Drop for PgPool {
         // documented path for clean teardown; this guards against
         // forgotten shutdown calls.
         if let Ok(mut inner) = self.inner.try_lock() {
-            let mut conns: Vec<Arc<Mutex<PooledConnection>>> =
+            let mut conns: Vec<Arc<PooledConnection>> =
                 inner.idle.drain(..).map(|e| e.conn).collect();
             conns.extend(inner.leased.drain().map(|(_, c)| c));
             for conn in conns {
-                if let Ok(mut guard) = conn.try_lock()
-                    && let Some(task) = guard.connection_task.take()
-                {
-                    task.abort();
-                }
+                conn.abort_connection_task();
             }
         }
         // Best-effort close of secondary cross-database browsers.
         if let Ok(mut map) = self.secondary_browsers.try_lock() {
-            for (_, conn) in map.drain() {
-                if let Ok(mut guard) = conn.try_lock()
-                    && let Some(task) = guard.connection_task.take()
-                {
-                    task.abort();
-                }
+            for (_, entry) in map.drain() {
+                entry.conn.abort_connection_task();
             }
         }
     }
@@ -929,8 +1020,9 @@ where
     PooledConnection {
         client,
         cancel_token,
-        active_cursor: None,
-        connection_task: Some(task),
+        operation_lock: Mutex::new(()),
+        active_cursor: Mutex::new(None),
+        connection_task: StdMutex::new(Some(task)),
     }
 }
 
