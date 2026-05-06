@@ -7,7 +7,7 @@ Async Rust domain layer for SSH, SFTP, FTP/FTPS, PostgreSQL, and connection mana
 
 ## Crates
 
-| Crate | Status|Docs| Purpose |
+| Crate | Release|Docs| Purpose |
 |-------|-------|------|-------|
 | [`ssh-commander-core`](crates/core)| [![crates.io](https://img.shields.io/crates/v/ssh-commander-core.svg)](https://crates.io/crates/ssh-commander-core)| [![docs.rs](https://docs.rs/ssh-commander-core/badge.svg)](https://docs.rs/ssh-commander-core) | SSH, SFTP, FTP/FTPS, Postgres explorer, connection manager, event bus, macOS keychain. |
 | [`ssh-commander-pg-parquet`](crates/pg-parquet)| [![crates.io](https://img.shields.io/crates/v/ssh-commander-pg-parquet.svg)](https://crates.io/crates/ssh-commander-pg-parquet)| [![docs.rs](https://docs.rs/ssh-commander-pg-parquet/badge.svg)](https://docs.rs/ssh-commander-pg-parquet) | Parquet export pipeline for the Postgres explorer (pulls in arrow + parquet — opt-in). |
