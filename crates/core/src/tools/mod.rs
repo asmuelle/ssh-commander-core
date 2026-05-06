@@ -6,7 +6,7 @@
 //! - `dns`     — multi-perspective DNS resolution across all connected hosts
 //! - `ports`   — listening-port inventory via `ss` / `netstat`
 //! - `tcpdump` — streaming packet capture via `tcpdump -lnn`, lines emitted
-//!               to the event bus for real-time UI display
+//!   to the event bus for real-time UI display
 //!
 //! All tools share `ToolsError` so the FFI surface can present a single error
 //! type to callers regardless of which sub-feature failed.

@@ -92,7 +92,7 @@ fn parse(repo_path: &str, output: &str) -> Result<GitStatus, ToolsError> {
             upstream = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
             // Format: "+<ahead> -<behind>"
-            for part in rest.trim().split_whitespace() {
+            for part in rest.split_whitespace() {
                 if let Some(n) = part.strip_prefix('+') {
                     ahead = n.parse().unwrap_or(0);
                 } else if let Some(n) = part.strip_prefix('-') {
@@ -113,10 +113,22 @@ fn parse(repo_path: &str, output: &str) -> Result<GitStatus, ToolsError> {
     if !log_block.is_empty() && !log_block.starts_with("fatal:") {
         let first_line = log_block.lines().next().unwrap_or("");
         let mut parts = first_line.splitn(4, '\t');
-        last_commit_sha = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
-        last_commit_author = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
-        last_commit_age = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
-        last_commit_subject = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        last_commit_sha = parts
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        last_commit_author = parts
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        last_commit_age = parts
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        last_commit_subject = parts
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
     }
 
     Ok(GitStatus {

@@ -259,10 +259,7 @@ pub struct SchemaContents {
     pub object_types: Vec<ObjectType>,
 }
 
-pub async fn list_sequences(
-    client: &Client,
-    schema: &str,
-) -> Result<Vec<Sequence>, PgDriverError> {
+pub async fn list_sequences(client: &Client, schema: &str) -> Result<Vec<Sequence>, PgDriverError> {
     let rows = client
         .query(
             "SELECT n.nspname,
@@ -286,10 +283,7 @@ pub async fn list_sequences(
         .collect())
 }
 
-pub async fn list_routines(
-    client: &Client,
-    schema: &str,
-) -> Result<Vec<Routine>, PgDriverError> {
+pub async fn list_routines(client: &Client, schema: &str) -> Result<Vec<Routine>, PgDriverError> {
     // pg_get_function_identity_arguments gives the parameter list
     // suitable for unique identification (no DEFAULTs / OUT params
     // confused with IN). pg_get_function_result is the return type;
@@ -511,21 +505,48 @@ mod tests {
 
     #[test]
     fn routine_kind_decodes_known_prokinds() {
-        assert_eq!(RoutineKind::from_prokind(b'f' as i8), Some(RoutineKind::Function));
-        assert_eq!(RoutineKind::from_prokind(b'p' as i8), Some(RoutineKind::Procedure));
-        assert_eq!(RoutineKind::from_prokind(b'a' as i8), Some(RoutineKind::Aggregate));
-        assert_eq!(RoutineKind::from_prokind(b'w' as i8), Some(RoutineKind::Window));
+        assert_eq!(
+            RoutineKind::from_prokind(b'f' as i8),
+            Some(RoutineKind::Function)
+        );
+        assert_eq!(
+            RoutineKind::from_prokind(b'p' as i8),
+            Some(RoutineKind::Procedure)
+        );
+        assert_eq!(
+            RoutineKind::from_prokind(b'a' as i8),
+            Some(RoutineKind::Aggregate)
+        );
+        assert_eq!(
+            RoutineKind::from_prokind(b'w' as i8),
+            Some(RoutineKind::Window)
+        );
         assert_eq!(RoutineKind::from_prokind(b'?' as i8), None);
     }
 
     #[test]
     fn object_type_kind_decodes_known_typtypes() {
-        assert_eq!(ObjectTypeKind::from_typtype(b'c' as i8), Some(ObjectTypeKind::Composite));
-        assert_eq!(ObjectTypeKind::from_typtype(b'e' as i8), Some(ObjectTypeKind::Enum));
-        assert_eq!(ObjectTypeKind::from_typtype(b'd' as i8), Some(ObjectTypeKind::Domain));
-        assert_eq!(ObjectTypeKind::from_typtype(b'r' as i8), Some(ObjectTypeKind::Range));
+        assert_eq!(
+            ObjectTypeKind::from_typtype(b'c' as i8),
+            Some(ObjectTypeKind::Composite)
+        );
+        assert_eq!(
+            ObjectTypeKind::from_typtype(b'e' as i8),
+            Some(ObjectTypeKind::Enum)
+        );
+        assert_eq!(
+            ObjectTypeKind::from_typtype(b'd' as i8),
+            Some(ObjectTypeKind::Domain)
+        );
+        assert_eq!(
+            ObjectTypeKind::from_typtype(b'r' as i8),
+            Some(ObjectTypeKind::Range)
+        );
         // multirange (PG 14+) groups with Range for tree purposes
-        assert_eq!(ObjectTypeKind::from_typtype(b'm' as i8), Some(ObjectTypeKind::Range));
+        assert_eq!(
+            ObjectTypeKind::from_typtype(b'm' as i8),
+            Some(ObjectTypeKind::Range)
+        );
         // 'b' = base type (skip — not user-defined in the
         // tree-browsing sense).
         assert_eq!(ObjectTypeKind::from_typtype(b'b' as i8), None);

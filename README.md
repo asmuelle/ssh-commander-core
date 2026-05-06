@@ -1,11 +1,18 @@
-# ssh-commander-core
+# ssh-commander
 
-[![Crates.io](https://img.shields.io/crates/v/ssh-commander-core.svg)](https://crates.io/crates/ssh-commander-core)
-[![Docs.rs](https://docs.rs/ssh-commander-core/badge.svg)](https://docs.rs/ssh-commander-core)
 [![CI](https://github.com/asmuelle/ssh-commander-core/actions/workflows/ci.yml/badge.svg)](https://github.com/asmuelle/ssh-commander-core/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 Async Rust domain layer for SSH, SFTP, FTP/FTPS, PostgreSQL, and connection management. The shared engine that powers [midnight-ssh](https://github.com/asmuelle/midnight-ssh) — extracted as a standalone library so any Rust client can use it.
+
+## Crates
+
+| Crate | Purpose |
+|-------|---------|
+| [`ssh-commander-core`](crates/core) [![crates.io](https://img.shields.io/crates/v/ssh-commander-core.svg)](https://crates.io/crates/ssh-commander-core) [![docs.rs](https://docs.rs/ssh-commander-core/badge.svg)](https://docs.rs/ssh-commander-core) | SSH, SFTP, FTP/FTPS, Postgres explorer, connection manager, event bus, macOS keychain. |
+| [`ssh-commander-pg-parquet`](crates/pg-parquet) [![crates.io](https://img.shields.io/crates/v/ssh-commander-pg-parquet.svg)](https://crates.io/crates/ssh-commander-pg-parquet) [![docs.rs](https://docs.rs/ssh-commander-pg-parquet/badge.svg)](https://docs.rs/ssh-commander-pg-parquet) | Parquet export pipeline for the Postgres explorer (pulls in arrow + parquet — opt-in). |
+
+Pull in only what you need: the core crate has zero arrow/parquet weight unless you also depend on `ssh-commander-pg-parquet`.
 
 ## Features
 
@@ -22,6 +29,8 @@ Async Rust domain layer for SSH, SFTP, FTP/FTPS, PostgreSQL, and connection mana
 ```toml
 [dependencies]
 ssh-commander-core = "0.1"
+# Optional: Parquet export for the Postgres explorer
+ssh-commander-pg-parquet = "0.1"
 ```
 
 Requires Rust **1.95+** (edition 2024).

@@ -208,10 +208,7 @@ pub async fn insert_row(
     // with the bound params, then for each column read a
     // `Option<String>` via the postgres-types Text feature. Since
     // we only RETURNING-cast one row, the cost is negligible.
-    let rows = client
-        .query(&sql, &params)
-        .await
-        .map_err(PgError::Driver)?;
+    let rows = client.query(&sql, &params).await.map_err(PgError::Driver)?;
     let row = rows.into_iter().next().ok_or_else(|| {
         // RETURNING on a successful single-row INSERT must produce
         // exactly one row. Anything else is a server-side surprise

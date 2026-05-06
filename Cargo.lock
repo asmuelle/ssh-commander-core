@@ -2810,14 +2810,11 @@ name = "ssh-commander-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrow-array",
- "arrow-schema",
  "async-std",
  "async-trait",
  "chrono",
  "dirs",
  "futures",
- "parquet",
  "rand 0.8.6",
  "russh",
  "russh-keys",
@@ -2837,6 +2834,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ssh-commander-pg-parquet"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "parquet",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

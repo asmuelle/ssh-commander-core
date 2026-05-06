@@ -112,11 +112,11 @@ fn parse_line(line: &str) -> Option<ListeningPort> {
                 }
             }
         }
-    } else if let Some(last) = cols.last() {
-        if let Some((p, name)) = last.split_once('/') {
-            pid = p.parse().ok();
-            process = Some(name.to_string());
-        }
+    } else if let Some(last) = cols.last()
+        && let Some((p, name)) = last.split_once('/')
+    {
+        pid = p.parse().ok();
+        process = Some(name.to_string());
     }
 
     Some(ListeningPort {

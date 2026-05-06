@@ -118,6 +118,12 @@ pub struct ConnectionManager {
     host_keys: Arc<HostKeyStore>,
 }
 
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionManager {
     pub fn new() -> Self {
         Self::with_host_keys(Arc::new(HostKeyStore::new(HostKeyStore::default_path())))
@@ -638,11 +644,8 @@ impl ConnectionManager {
         self.clear_pending_connection(&connection_id).await;
 
         let pool = connect_result?;
-        self.replace_managed_connection(
-            connection_id,
-            ManagedConnection::Postgres(pool),
-        )
-        .await
+        self.replace_managed_connection(connection_id, ManagedConnection::Postgres(pool))
+            .await
     }
 
     pub async fn close_postgres_connection(&self, connection_id: &str) -> Result<()> {

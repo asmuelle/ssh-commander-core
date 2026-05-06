@@ -203,9 +203,7 @@ fn parse_dig_lines(out: &str) -> Vec<String> {
 /// validly contain these — anything else is an injection attempt.
 fn shell_safe(name: &str) -> String {
     name.chars()
-        .filter(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
-        })
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         .collect()
 }
 

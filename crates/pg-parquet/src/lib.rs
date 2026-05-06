@@ -112,11 +112,7 @@ impl ParquetRegistry {
         Ok(id)
     }
 
-    pub fn append(
-        &self,
-        id: u64,
-        rows: &[Vec<Option<String>>],
-    ) -> Result<(), ParquetExportError> {
+    pub fn append(&self, id: u64, rows: &[Vec<Option<String>>]) -> Result<(), ParquetExportError> {
         let mut map = self.exporters.lock().expect("registry poisoned");
         let exporter = map.get_mut(&id).ok_or(ParquetExportError::UnknownWriter)?;
         exporter.append_rows(rows)
@@ -147,10 +143,13 @@ mod tests {
             .open(&path, &["id".into(), "name".into()])
             .expect("open");
         registry
-            .append(id, &[
-                vec![Some("1".into()), Some("alice".into())],
-                vec![Some("2".into()), None],
-            ])
+            .append(
+                id,
+                &[
+                    vec![Some("1".into()), Some("alice".into())],
+                    vec![Some("2".into()), None],
+                ],
+            )
             .expect("append");
         registry.close(id).expect("close");
         // File exists with non-zero size — closing flushed the

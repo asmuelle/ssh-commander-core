@@ -475,10 +475,7 @@ pub async fn open_query(
     // Open the transaction and cursor in one round trip. The user's
     // SQL is interpolated verbatim — sanitization isn't ours to do
     // (this is a power-user surface where users type any SQL).
-    let begin = format!(
-        "BEGIN; DECLARE {} NO SCROLL CURSOR FOR {}",
-        cursor_id, sql
-    );
+    let begin = format!("BEGIN; DECLARE {} NO SCROLL CURSOR FOR {}", cursor_id, sql);
     if let Err(e) = client.batch_execute(&begin).await {
         // Make sure we don't leak a half-open transaction.
         let _ = client.batch_execute("ROLLBACK").await;
@@ -671,16 +668,14 @@ mod tests {
 
     #[test]
     fn smart_split_returns_preamble_and_main() {
-        let (pre, main) =
-            split_at_last_statement("SET x = 1; SELECT * FROM t").expect("split");
+        let (pre, main) = split_at_last_statement("SET x = 1; SELECT * FROM t").expect("split");
         assert_eq!(pre, "SET x = 1;");
         assert_eq!(main, "SELECT * FROM t");
     }
 
     #[test]
     fn smart_split_handles_multiple_preamble_statements() {
-        let (pre, main) =
-            split_at_last_statement("SET x = 1; SET y = 2; SELECT 1").expect("split");
+        let (pre, main) = split_at_last_statement("SET x = 1; SET y = 2; SELECT 1").expect("split");
         assert_eq!(pre, "SET x = 1; SET y = 2;");
         assert_eq!(main, "SELECT 1");
     }
@@ -697,8 +692,7 @@ mod tests {
 
     #[test]
     fn smart_split_ignores_in_string_semicolons() {
-        let (pre, main) =
-            split_at_last_statement("SET x = 'a;b'; SELECT 1").expect("split");
+        let (pre, main) = split_at_last_statement("SET x = 'a;b'; SELECT 1").expect("split");
         assert_eq!(pre, "SET x = 'a;b';");
         assert_eq!(main, "SELECT 1");
     }

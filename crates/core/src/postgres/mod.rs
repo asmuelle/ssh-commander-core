@@ -35,7 +35,6 @@ pub mod config;
 pub mod edit;
 pub mod exec;
 pub mod introspect;
-pub mod parquet_export;
 pub mod tunnel;
 
 pub use config::{PgAuthMethod, PgConfig, PgTlsMode, SshTunnelRef};
@@ -45,7 +44,6 @@ pub use introspect::{
     ColumnDetail, DbSummary, ObjectType, ObjectTypeKind, Relation, RelationKind, Routine,
     RoutineKind, SchemaContents, SchemaSummary, Sequence,
 };
-pub use parquet_export::{ParquetExportError, ParquetRegistry};
 pub use tunnel::SshTunnel;
 
 use std::collections::HashMap;
@@ -223,13 +221,9 @@ impl PgPool {
                     "ssh tunnel requested but no ssh client supplied".into(),
                 ));
             };
-            let t = SshTunnel::open(
-                ssh,
-                tunnel_ref.remote_host.clone(),
-                tunnel_ref.remote_port,
-            )
-            .await
-            .map_err(|e| PgError::Tunnel(format!("failed to open ssh tunnel: {e}")))?;
+            let t = SshTunnel::open(ssh, tunnel_ref.remote_host.clone(), tunnel_ref.remote_port)
+                .await
+                .map_err(|e| PgError::Tunnel(format!("failed to open ssh tunnel: {e}")))?;
             Some(Arc::new(t))
         } else {
             None
@@ -457,6 +451,7 @@ impl PgPool {
     /// don't block on another tab's pagination cursor. Returns
     /// `UpdateOutcome { rows_affected }` — the UI treats `0` as
     /// "row no longer there, please refresh".
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_cell(
         &self,
         session_id: &str,
@@ -514,21 +509,17 @@ impl PgPool {
         edit::delete_rows(&guard.client, schema, table, ctids).await
     }
 
-    pub async fn close_query(
-        &self,
-        session_id: &str,
-        cursor_id: &str,
-    ) -> Result<(), PgError> {
+    pub async fn close_query(&self, session_id: &str, cursor_id: &str) -> Result<(), PgError> {
         let Some(conn) = self.leased_only(session_id).await else {
             return Ok(()); // Nothing to close — idempotent.
         };
         let mut guard = conn.lock().await;
-        if let Some(c) = guard.active_cursor.as_ref() {
-            if c.cursor_id == cursor_id {
-                let cursor = guard.active_cursor.take().expect("just checked");
-                let client = &guard.client;
-                exec::close_query(client, &cursor).await;
-            }
+        if let Some(c) = guard.active_cursor.as_ref()
+            && c.cursor_id == cursor_id
+        {
+            let cursor = guard.active_cursor.take().expect("just checked");
+            let client = &guard.client;
+            exec::close_query(client, &cursor).await;
         }
         Ok(())
     }
@@ -595,7 +586,7 @@ impl PgPool {
             let mut map = self.secondary_browsers.lock().await;
             map.drain().map(|(_, c)| c).collect()
         };
-        let conns_with_secondaries = conns.into_iter().chain(secondaries.into_iter());
+        let conns_with_secondaries = conns.into_iter().chain(secondaries);
         let conns: Vec<Arc<Mutex<PooledConnection>>> = conns_with_secondaries.collect();
         for conn in conns {
             // Best-effort task abort; the wire closes when `Client`
@@ -657,22 +648,17 @@ impl PgPool {
                 }
                 inner.total += 1;
             }
-            let new_conn = match open_one(
-                &self.config,
-                self.tunnel.as_deref(),
-                &self.tls_connector,
-            )
-            .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    // Roll back the slot reservation on failure so
-                    // the pool can try again later.
-                    let mut inner = self.inner.lock().await;
-                    inner.total = inner.total.saturating_sub(1);
-                    return Err(e);
-                }
-            };
+            let new_conn =
+                match open_one(&self.config, self.tunnel.as_deref(), &self.tls_connector).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Roll back the slot reservation on failure so
+                        // the pool can try again later.
+                        let mut inner = self.inner.lock().await;
+                        inner.total = inner.total.saturating_sub(1);
+                        return Err(e);
+                    }
+                };
             let conn = Arc::new(Mutex::new(new_conn));
             self.assign_lease(session_id, conn.clone()).await;
             return Ok(conn);
@@ -746,7 +732,6 @@ impl PgPool {
         let mut inner = self.inner.lock().await;
         inner.leased.remove(session_id)
     }
-
 }
 
 impl Drop for PgPool {
@@ -763,20 +748,20 @@ impl Drop for PgPool {
                 inner.idle.drain(..).map(|e| e.conn).collect();
             conns.extend(inner.leased.drain().map(|(_, c)| c));
             for conn in conns {
-                if let Ok(mut guard) = conn.try_lock() {
-                    if let Some(task) = guard.connection_task.take() {
-                        task.abort();
-                    }
+                if let Ok(mut guard) = conn.try_lock()
+                    && let Some(task) = guard.connection_task.take()
+                {
+                    task.abort();
                 }
             }
         }
         // Best-effort close of secondary cross-database browsers.
         if let Ok(mut map) = self.secondary_browsers.try_lock() {
             for (_, conn) in map.drain() {
-                if let Ok(mut guard) = conn.try_lock() {
-                    if let Some(task) = guard.connection_task.take() {
-                        task.abort();
-                    }
+                if let Ok(mut guard) = conn.try_lock()
+                    && let Some(task) = guard.connection_task.take()
+                {
+                    task.abort();
                 }
             }
         }
@@ -1089,12 +1074,7 @@ mod tests {
         assert_eq!(drop_idx, vec![1, 3]);
 
         // min_idle = 0: all aged entries evicted, only fresh survives.
-        let (keep, drop_idx) = run_policy(
-            vec![(0, aged), (1, fresh), (2, aged)],
-            now,
-            timeout,
-            0,
-        );
+        let (keep, drop_idx) = run_policy(vec![(0, aged), (1, fresh), (2, aged)], now, timeout, 0);
         assert_eq!(keep, vec![1]);
         assert_eq!(drop_idx, vec![0, 2]);
     }

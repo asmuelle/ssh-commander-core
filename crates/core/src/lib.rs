@@ -47,9 +47,9 @@ pub use keychain::{
 };
 pub use postgres::{
     ActiveCursor, BROWSER_SESSION_ID, ColumnDetail, ColumnMeta, DbSummary, ExecutionOutcome,
-    InsertColumnInput, InsertedRow, ObjectType, ObjectTypeKind, PageResult, ParquetExportError,
-    ParquetRegistry, PgAuthMethod, PgConfig, PgError, PgPool, PgTlsMode, Relation, RelationKind,
-    Routine, RoutineKind, SchemaContents, SchemaSummary, Sequence, SshTunnelRef, UpdateOutcome,
+    InsertColumnInput, InsertedRow, ObjectType, ObjectTypeKind, PageResult, PgAuthMethod, PgConfig,
+    PgError, PgPool, PgTlsMode, Relation, RelationKind, Routine, RoutineKind, SchemaContents,
+    SchemaSummary, Sequence, SshTunnelRef, UpdateOutcome,
 };
 pub use sftp_client::{
     FileEntry, FileEntryType, RemoteFileEntry, SftpAuthMethod, SftpConfig, StandaloneSftpClient,

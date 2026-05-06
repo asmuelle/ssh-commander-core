@@ -33,7 +33,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets --no-fail-fast
+      - run: cargo test --workspace --all-targets --no-fail-fast
 
   msrv:
     name: msrv (1.95)
@@ -55,13 +55,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
+      - run: cargo check --workspace --all-targets
 
   publish-dry-run:
-    name: cargo publish --dry-run
+    name: cargo publish --dry-run (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [ssh-commander-core, ssh-commander-pg-parquet]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo publish --dry-run --allow-dirty
+      - run: cargo publish -p ${{ matrix.crate }} --dry-run --allow-dirty

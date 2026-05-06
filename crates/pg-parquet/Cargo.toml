@@ -1,0 +1,23 @@
+[package]
+name = "ssh-commander-pg-parquet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Parquet export pipeline for ssh-commander-core's PostgreSQL explorer. Streams text-typed columns into Parquet files via a process-wide writer registry."
+documentation = "https://docs.rs/ssh-commander-pg-parquet"
+readme = "../../README.md"
+keywords = ["parquet", "arrow", "postgres", "export"]
+categories = ["database", "encoding"]
+
+[dependencies]
+parquet = "54"
+arrow-array = "54"
+arrow-schema = "54"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
