@@ -3,7 +3,7 @@
 [![CI](https://github.com/asmuelle/ssh-commander-core/actions/workflows/ci.yml/badge.svg)](https://github.com/asmuelle/ssh-commander-core/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Async Rust domain layer for SSH, SFTP, FTP/FTPS, PostgreSQL, and connection management. The shared engine that powers [midnight-ssh](https://github.com/asmuelle/midnight-ssh) — extracted as a standalone library so any Rust client can use it.
+Async Rust domain layer for SSH, SFTP, FTP/FTPS, PostgreSQL, and connection management. 
 
 ## Crates
 
