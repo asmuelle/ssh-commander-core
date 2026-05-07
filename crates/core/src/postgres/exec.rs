@@ -21,7 +21,7 @@
 //!   probably more; actual < n means the cursor exhausted).
 //! - `CLOSE c_<uuid>; COMMIT` releases the server resources.
 //!
-//! Single-cursor invariant is enforced by [`PgClient`](super::PgClient)
+//! Single-cursor invariant is enforced by the pool's per-connection lease
 //! (one transaction per connection on the wire). If a second `execute`
 //! call comes in while a cursor is open, the old one is closed first
 //! — the surfaced `CursorExpired` error tells the previous tab's UI
@@ -567,6 +567,7 @@ fn collect_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn execution_outcome_round_trips() {
@@ -702,5 +703,21 @@ mod tests {
     fn smart_split_returns_none_for_single_statement() {
         assert!(split_at_last_statement("SELECT 1").is_none());
         assert!(split_at_last_statement("SELECT 1;").is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn dollar_quoted_semicolons_do_not_create_false_splits(body in "[A-Za-z0-9_ ;,()\\n]{0,128}") {
+            let sql = format!("SELECT $$ {body} $$");
+            prop_assert!(!is_multi_statement(&sql));
+            prop_assert!(split_at_last_statement(&sql).is_none());
+        }
+
+        #[test]
+        fn trailing_comment_after_semicolon_is_still_single_statement(comment in "[A-Za-z0-9_ ;,()]{0,128}") {
+            let sql = format!("SELECT 1; -- {comment}");
+            prop_assert!(!is_multi_statement(&sql));
+            prop_assert!(split_at_last_statement(&sql).is_none());
+        }
     }
 }

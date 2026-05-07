@@ -45,4 +45,5 @@ security-framework = "3"
 security-framework-sys = "2"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"

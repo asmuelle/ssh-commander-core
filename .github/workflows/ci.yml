@@ -48,6 +48,70 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets --no-fail-fast
 
+  postgres-integration:
+    name: postgres integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PG_TEST_HOST: 127.0.0.1
+      PG_TEST_PORT: 5432
+      PG_TEST_DB: postgres
+      PG_TEST_USER: postgres
+      PG_TEST_PASSWORD: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p ssh-commander-core --test postgres_integration -- --nocapture
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+
+  security:
+    name: dependency security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - run: cargo audit
+      - run: cargo deny check advisories bans licenses sources
+
+  coverage:
+    name: coverage summary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --all-targets --summary-only
+
   msrv:
     name: msrv (1.95)
     runs-on: ubuntu-latest

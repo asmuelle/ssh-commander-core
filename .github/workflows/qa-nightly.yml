@@ -1,0 +1,110 @@
+name: Nightly QA
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  protocol-smoke:
+    name: ssh and sftp smoke
+    runs-on: ubuntu-latest
+    services:
+      openssh:
+        image: lscr.io/linuxserver/openssh-server:latest
+        env:
+          PUID: 1000
+          PGID: 1000
+          TZ: Etc/UTC
+          USER_NAME: testuser
+          USER_PASSWORD: testpass
+          PASSWORD_ACCESS: true
+          SUDO_ACCESS: false
+        ports:
+          - 2222:2222
+    env:
+      SSH_TEST_HOST: 127.0.0.1
+      SSH_TEST_PORT: 2222
+      SSH_TEST_USER: testuser
+      SSH_TEST_PASSWORD: testpass
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Wait for OpenSSH
+        run: |
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 2222; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - run: cargo test -p ssh-commander-core --test ssh_sftp_integration -- --nocapture
+
+  ftp-smoke:
+    name: ftp smoke
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      pure-ftpd:
+        image: stilliard/pure-ftpd:hardened
+        env:
+          FTP_USER_NAME: testuser
+          FTP_USER_PASS: testpass
+          FTP_USER_HOME: /home/testuser
+          PUBLICHOST: 127.0.0.1
+          ADDED_FLAGS: "-p 30000:30009"
+        ports:
+          - 2121:21
+          - "30000-30009:30000-30009"
+    env:
+      FTP_TEST_HOST: 127.0.0.1
+      FTP_TEST_PORT: 2121
+      FTP_TEST_USER: testuser
+      FTP_TEST_PASS: testpass
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Wait for FTP
+        run: |
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 2121; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - run: 'cargo test -p ssh-commander-core ftp_client::tests:: -- --nocapture'
+
+  public-api:
+    name: public api compatibility
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+      - run: cargo semver-checks check-release
+
+  mutants:
+    name: mutation smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - run: cargo mutants --workspace --timeout 60 --no-shuffle

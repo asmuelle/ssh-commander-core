@@ -57,6 +57,7 @@ pub fn validate_signal(s: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn quote_empty_string() {
@@ -117,5 +118,21 @@ mod tests {
         assert!(validate_signal("999").is_err());
         assert!(validate_signal("FOO").is_err());
         assert!(validate_signal("15; rm -rf /").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn quote_matches_posix_single_quote_escape_contract(s in ".*") {
+            let expected = format!("'{}'", s.replace('\'', "'\\''"));
+            prop_assert_eq!(quote(&s), expected);
+        }
+
+        #[test]
+        fn validate_pid_accepts_only_positive_decimal_u32(n in 1u32..=u32::MAX) {
+            let rendered = n.to_string();
+            prop_assert_eq!(validate_pid(&rendered).unwrap(), rendered.as_str());
+            let padded = format!("  {rendered}  ");
+            prop_assert_eq!(validate_pid(&padded).unwrap(), rendered.as_str());
+        }
     }
 }

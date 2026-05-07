@@ -218,6 +218,7 @@ fn _ensure_error_unused(e: ToolsError) -> ToolsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_dig_short_output() {
@@ -235,5 +236,15 @@ mod tests {
         assert_eq!(shell_safe("example.com"), "example.com");
         assert_eq!(shell_safe("ex; rm -rf /"), "exrm-rf");
         assert_eq!(shell_safe("foo$(bad)"), "foobad");
+    }
+
+    proptest! {
+        #[test]
+        fn shell_safe_only_emits_dns_safe_characters(input in ".*") {
+            let sanitized = shell_safe(&input);
+            prop_assert!(sanitized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+        }
     }
 }

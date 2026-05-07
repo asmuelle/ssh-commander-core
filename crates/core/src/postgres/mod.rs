@@ -109,6 +109,8 @@ pub enum PgError {
     /// the session was released.
     #[error("cursor no longer available: {0}")]
     CursorExpired(String),
+    #[error("invalid postgres input: {0}")]
+    InvalidInput(String),
     /// The pool is at `max_size` and all connections are currently
     /// leased to other sessions. Caller should wait and retry, or
     /// release another session.

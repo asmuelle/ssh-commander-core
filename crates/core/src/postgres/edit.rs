@@ -69,11 +69,12 @@ pub async fn update_cell(
     // round-tripping through the UI as a String just works.
     let rows_affected = match new_value {
         Some(value) => {
+            let ty = validate_type_expression(column_type)?;
             let sql = format!(
-                "UPDATE {qualified} SET {col} = $1::{ty} WHERE ctid = $2::tid",
+                "UPDATE {qualified} SET {col} = $1::text::{ty} WHERE ctid = $2::tid",
                 qualified = qualified,
                 col = col,
-                ty = quote_ident(column_type),
+                ty = ty,
             );
             client
                 .execute(&sql, &[&value, &ctid])
@@ -151,8 +152,10 @@ pub async fn insert_row(
         let placeholders = inputs
             .iter()
             .enumerate()
-            .map(|(idx, i)| format!("${}::{}", idx + 1, quote_ident(&i.type_name)))
-            .collect::<Vec<_>>()
+            .map(|(idx, i)| {
+                validate_type_expression(&i.type_name).map(|ty| format!("${}::text::{ty}", idx + 1))
+            })
+            .collect::<Result<Vec<_>, PgError>>()?
             .join(", ");
         values_clause = format!("VALUES ({placeholders})");
     }
@@ -263,6 +266,51 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Validate a type expression produced by `pg_catalog.format_type`.
+///
+/// PostgreSQL does not let a cast target be bound as a parameter, so
+/// edit/insert SQL has to embed the type expression. We accept the
+/// conservative subset emitted for built-in/common formatted types
+/// (`integer`, `character varying(255)`, `timestamp with time zone`,
+/// `numeric(10,2)`, `"Schema"."Type"[]`) and reject shell/SQL
+/// metacharacters that could terminate the cast expression.
+fn validate_type_expression(s: &str) -> Result<&str, PgError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(PgError::InvalidInput(
+            "type expression is empty".to_string(),
+        ));
+    }
+
+    if !trimmed.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | ' ' | '"' | '.' | ',' | '(' | ')' | '[' | ']')
+    }) {
+        return Err(PgError::InvalidInput(format!(
+            "unsupported type expression: {trimmed}"
+        )));
+    }
+
+    let mut quoted = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if quoted && chars.peek() == Some(&'"') {
+                let _ = chars.next();
+            } else {
+                quoted = !quoted;
+            }
+        }
+    }
+    if quoted {
+        return Err(PgError::InvalidInput(format!(
+            "unterminated quoted type expression: {trimmed}"
+        )));
+    }
+
+    Ok(trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +335,34 @@ mod tests {
         let json = serde_json::to_string(&o).expect("serialize");
         let back: UpdateOutcome = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.rows_affected, 1);
+    }
+
+    #[test]
+    fn type_expression_accepts_common_format_type_outputs() {
+        for ty in [
+            "integer",
+            "character varying(255)",
+            "timestamp with time zone",
+            "numeric(10,2)",
+            "text[]",
+            "\"MySchema\".\"MyType\"[]",
+        ] {
+            assert_eq!(validate_type_expression(ty).unwrap(), ty);
+        }
+    }
+
+    #[test]
+    fn type_expression_rejects_injection_shapes() {
+        for ty in [
+            "",
+            "text; DROP TABLE x",
+            "text -- comment",
+            "text/*comment*/",
+            "text 'literal'",
+            "$tag$text$tag$",
+            "\"unterminated",
+        ] {
+            assert!(validate_type_expression(ty).is_err(), "{ty}");
+        }
     }
 }

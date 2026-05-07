@@ -61,6 +61,11 @@ async fn main() -> anyhow::Result<()> {
 
 See [`docs.rs/ssh-commander-core`](https://docs.rs/ssh-commander-core) for the full API.
 
+## QA
+
+Fast checks, live Postgres tests, and protocol smoke-test commands are documented
+in [`docs/qa.md`](docs/qa.md).
+
 ## Status
 
 `0.1.x` — pre-1.0, expect API changes. Originally extracted from a multi-crate workspace; the published surface is opinionated and follows the consumer's needs. Issues and PRs that improve generality are welcome.
