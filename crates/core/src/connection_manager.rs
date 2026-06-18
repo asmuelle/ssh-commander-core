@@ -12,9 +12,9 @@ use crate::ssh::{HostKeyStore, PtySession, SshClient, SshConfig};
 use crate::ssh::{SshTunnel, SshTunnelRef};
 #[cfg(feature = "desktop")]
 use crate::vnc_client::VncClient;
+use anyhow::Result;
 #[cfg(feature = "postgres")]
 use ssh_commander_pg::{PgConfig, PgPool};
-use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -787,7 +787,9 @@ impl ConnectionManager {
             };
             let opened = SshTunnel::open(ssh_client, t.remote_host.clone(), t.remote_port)
                 .await
-                .map_err(|e| anyhow::Error::from(ssh_commander_pg::PgError::Tunnel(e.to_string())))?;
+                .map_err(|e| {
+                    anyhow::Error::from(ssh_commander_pg::PgError::Tunnel(e.to_string()))
+                })?;
             // Redirect the pool at the local end of the forward.
             config.host = "127.0.0.1".to_string();
             config.port = opened.local_port();

@@ -665,17 +665,16 @@ impl PgPool {
                 }
                 inner.total += 1;
             }
-            let new_conn =
-                match open_one(&self.config, &self.tls_connector).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Roll back the slot reservation on failure so
-                        // the pool can try again later.
-                        let mut inner = self.inner.lock().await;
-                        inner.total = inner.total.saturating_sub(1);
-                        return Err(e);
-                    }
-                };
+            let new_conn = match open_one(&self.config, &self.tls_connector).await {
+                Ok(c) => c,
+                Err(e) => {
+                    // Roll back the slot reservation on failure so
+                    // the pool can try again later.
+                    let mut inner = self.inner.lock().await;
+                    inner.total = inner.total.saturating_sub(1);
+                    return Err(e);
+                }
+            };
             let conn = Arc::new(new_conn);
             self.assign_lease(session_id, conn.clone()).await;
             return Ok(conn);
@@ -870,10 +869,7 @@ async fn run_eviction(pool: Weak<PgPool>, cancel: CancellationToken) {
 // Connection construction (private)
 // ============================================================================
 
-async fn open_one(
-    cfg: &PgConfig,
-    tls: &TlsConnectorKind,
-) -> Result<PooledConnection, PgError> {
+async fn open_one(cfg: &PgConfig, tls: &TlsConnectorKind) -> Result<PooledConnection, PgError> {
     let driver_cfg = build_driver_config(cfg)?;
     match tls {
         TlsConnectorKind::NoTls => {

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use russh_keys::PublicKeyBase64;
+// In russh 0.61, russh_keys is merged into russh::keys.
+use russh::keys::{HashAlg, PublicKeyBase64};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -88,10 +89,12 @@ impl HostKeyStore {
         &self,
         host: &str,
         port: u16,
-        key: &russh_keys::key::PublicKey,
+        key: &russh::keys::PublicKey,
     ) -> Result<Verdict> {
         let offered = key.public_key_base64();
-        let offered_fp = key.fingerprint();
+        // fingerprint() now takes a HashAlg in russh 0.61; SHA-256 matches
+        // the "SHA256:…" format shown in user-facing messages.
+        let offered_fp = key.fingerprint(HashAlg::Sha256).to_string();
         let key_id = Self::make_key(host, port);
 
         let mut guard = self.state.lock().await;
@@ -114,12 +117,7 @@ impl HostKeyStore {
 
     /// Persist the server-offered key as trusted for `(host, port)`.
     /// Creates the parent directory if missing.
-    pub async fn trust(
-        &self,
-        host: &str,
-        port: u16,
-        key: &russh_keys::key::PublicKey,
-    ) -> Result<()> {
+    pub async fn trust(&self, host: &str, port: u16, key: &russh::keys::PublicKey) -> Result<()> {
         let offered = key.public_key_base64();
         let key_id = Self::make_key(host, port);
 
@@ -219,11 +217,14 @@ impl HostKeyStore {
 }
 
 /// Compute an SHA-256 fingerprint from a stored base64 public-key blob,
-/// matching the format returned by `key::PublicKey::fingerprint()` so both
-/// sides of a mismatch display in the same form.
+/// matching the format used in `verify` so both sides of a mismatch display
+/// in the same form.
+///
+/// In russh 0.61, `parse_public_key_base64` lives in `russh::keys` and
+/// `PublicKey::fingerprint` requires an explicit `HashAlg`.
 fn fingerprint_from_stored(blob_b64: &str) -> String {
-    match russh_keys::parse_public_key_base64(blob_b64) {
-        Ok(key) => key.fingerprint(),
+    match russh::keys::parse_public_key_base64(blob_b64) {
+        Ok(key) => key.fingerprint(HashAlg::Sha256).to_string(),
         Err(_) => String::from("<unparseable stored key>"),
     }
 }
@@ -231,7 +232,6 @@ fn fingerprint_from_stored(blob_b64: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use russh_keys::key::KeyPair;
     use tempfile::TempDir;
 
     fn temp_store() -> (TempDir, HostKeyStore) {
@@ -255,11 +255,20 @@ mod tests {
         assert!(guard.as_ref().unwrap().is_empty());
     }
 
-    fn test_public_key() -> russh_keys::key::PublicKey {
-        KeyPair::generate_ed25519()
-            .expect("generate keypair")
-            .clone_public_key()
-            .expect("clone public key")
+    /// In russh 0.61, key generation uses `ssh_key::PrivateKey::random` and
+    /// we extract the public key with `.public_key()`. The old `KeyPair::generate_ed25519`
+    /// / `clone_public_key` API is no longer available.
+    ///
+    /// Use `russh::keys::key::safe_rng()` for a compatible `CryptoRng` — russh
+    /// uses rand 0.10 internally, which is not the same as rand 0.8 in the core crate.
+    fn test_public_key() -> russh::keys::PublicKey {
+        russh::keys::PrivateKey::random(
+            &mut russh::keys::key::safe_rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .expect("generate ed25519 key")
+        .public_key()
+        .clone()
     }
 
     #[tokio::test]

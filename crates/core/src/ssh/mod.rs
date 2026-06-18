@@ -2,9 +2,8 @@ use crate::file_entry::{
     FileEntryType, RemoteFileEntry, format_permissions, format_unix_timestamp,
 };
 use anyhow::Result;
+use russh::keys::{HashAlg, PublicKeyBase64};
 use russh::*;
-use russh_keys::PublicKeyBase64;
-use russh_keys::*;
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -32,15 +31,26 @@ pub const SFTP_CHUNK_SIZE: usize = crate::file_entry::FILE_TRANSFER_CHUNK_SIZE;
 /// Preferred host-key algorithms advertised to the server, ordered from most to
 /// least preferred.  RSA variants (including the legacy `ssh-rsa` / SHA-1) are
 /// included so that older servers that only offer RSA host keys are still
-/// reachable.  The `openssl` feature on `russh` / `russh-keys` must be enabled
-/// for the RSA entries to have any effect.
-pub static PREFERRED_HOST_KEY_ALGOS: &[russh_keys::key::Name] = &[
-    russh_keys::key::ED25519,
-    russh_keys::key::ECDSA_SHA2_NISTP256,
-    russh_keys::key::ECDSA_SHA2_NISTP521,
-    russh_keys::key::RSA_SHA2_256,
-    russh_keys::key::RSA_SHA2_512,
-    russh_keys::key::SSH_RSA,
+/// reachable.
+///
+/// In russh 0.61, host-key algorithms are represented as `ssh_key::Algorithm`
+/// (re-exported at `russh::keys::Algorithm`) instead of the old `key::Name` constants.
+pub static PREFERRED_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
+    russh::keys::Algorithm::Ed25519,
+    russh::keys::Algorithm::Ecdsa {
+        curve: russh::keys::EcdsaCurve::NistP256,
+    },
+    russh::keys::Algorithm::Ecdsa {
+        curve: russh::keys::EcdsaCurve::NistP521,
+    },
+    russh::keys::Algorithm::Rsa {
+        hash: Some(russh::keys::HashAlg::Sha256),
+    },
+    russh::keys::Algorithm::Rsa {
+        hash: Some(russh::keys::HashAlg::Sha512),
+    },
+    // Legacy ssh-rsa (SHA-1) for very old servers that advertise no modern RSA variant.
+    russh::keys::Algorithm::Rsa { hash: None },
 ];
 
 /// Key-exchange algorithms offered to the server, most-preferred first.
@@ -212,13 +222,13 @@ impl Client {
     }
 }
 
-#[async_trait::async_trait]
+// russh 0.61 uses RPITIT (no async_trait needed for the Handler trait itself).
 impl client::Handler for Client {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &key::PublicKey,
+        server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
         match self
             .store
@@ -238,7 +248,8 @@ impl client::Handler for Client {
                     "TOFU: trusting new host key for {}:{} (fingerprint SHA256:{})",
                     self.host,
                     self.port,
-                    server_public_key.fingerprint()
+                    // fingerprint() now requires a HashAlg argument in russh 0.61.
+                    server_public_key.fingerprint(HashAlg::Sha256)
                 );
                 if let Err(e) = self
                     .store
@@ -312,7 +323,9 @@ pub(crate) enum ResolvedAuth<'a> {
         password: &'a str,
     },
     Key {
-        key: Box<key::KeyPair>,
+        /// In russh 0.61 the key type is `ssh_key::PrivateKey` (re-exported as
+        /// `russh::keys::PrivateKey`), replacing the old `key::KeyPair`.
+        key: Box<russh::keys::PrivateKey>,
         /// Optional hint for user-facing error messages (the key path the
         /// user asked us to load). Not used for the authentication itself.
         key_path_hint: Option<&'a str>,
@@ -335,8 +348,10 @@ pub(crate) async fn connect_authenticated(
 ) -> Result<client::Handle<Client>> {
     let ssh_config = client::Config {
         preferred: russh::Preferred {
-            key: PREFERRED_HOST_KEY_ALGOS,
-            kex: PREFERRED_KEX_ALGOS,
+            // Cow::Borrowed is required in russh 0.61 — the fields changed from
+            // raw slices to Cow<'static, [...]>.
+            key: std::borrow::Cow::Borrowed(PREFERRED_HOST_KEY_ALGOS),
+            kex: std::borrow::Cow::Borrowed(PREFERRED_KEX_ALGOS),
             ..russh::Preferred::DEFAULT
         },
         keepalive_interval: Some(Duration::from_secs(60)),
@@ -408,22 +423,36 @@ pub(crate) async fn connect_authenticated(
         ),
     };
 
+    // russh 0.61: authenticate_* methods return AuthResult (Success / Failure enum)
+    // rather than bool. Call .success() to map to the bool the guard below expects.
     let authenticated = match auth {
         ResolvedAuth::Password { password } => session
             .authenticate_password(username, password)
             .await
-            .map_err(|e| anyhow::anyhow!("Password authentication failed: {}", e))?,
-        ResolvedAuth::Key { key, .. } => session
-            .authenticate_publickey(username, Arc::new(*key))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Public key authentication failed: {}. The key may not be authorized on the server.",
-                    e
-                )
-            })?,
+            .map_err(|e| anyhow::anyhow!("Password authentication failed: {}", e))?
+            .success(),
+        ResolvedAuth::Key { key, .. } => {
+            // russh 0.61: authenticate_publickey takes PrivateKeyWithHashAlg
+            // instead of Arc<KeyPair>. Pass None for hash_alg so non-RSA keys
+            // use their natural algorithm and RSA falls back to SHA-1 (caller
+            // can upgrade by setting Some(HashAlg::Sha256) when desired).
+            let key_with_alg = russh::keys::key::PrivateKeyWithHashAlg::new(Arc::new(*key), None);
+            session
+                .authenticate_publickey(username, key_with_alg)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Public key authentication failed: {}. The key may not be authorized on the server.",
+                        e
+                    )
+                })?
+                .success()
+        }
         ResolvedAuth::Agent { identity_hint } => {
-            let mut agent = russh_keys::agent::client::AgentClient::connect_env()
+            // russh 0.61: authenticate_future is removed. Use authenticate_publickey_with,
+            // which takes a public key + optional hash_alg + a &mut Signer. AgentClient
+            // implements the Signer trait in russh 0.61 (russh::auth::Signer).
+            let mut agent = russh::keys::agent::client::AgentClient::connect_env()
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -431,10 +460,11 @@ pub(crate) async fn connect_authenticated(
                         e
                     )
                 })?;
-            let identities = agent.request_identities().await.map_err(|e| {
-                anyhow::anyhow!("SSH agent did not return identities: {}", e)
-            })?;
-            let key = select_agent_identity(identities, identity_hint).ok_or_else(|| {
+            let identities = agent
+                .request_identities()
+                .await
+                .map_err(|e| anyhow::anyhow!("SSH agent did not return identities: {}", e))?;
+            let identity = select_agent_identity(identities, identity_hint).ok_or_else(|| {
                 if let Some(hint) = identity_hint.filter(|hint| !hint.is_empty()) {
                     anyhow::anyhow!(
                         "SSH agent has no identity matching '{}'. Add the key to your agent or clear the identity hint.",
@@ -444,8 +474,13 @@ pub(crate) async fn connect_authenticated(
                     anyhow::anyhow!("SSH agent has no identities. Add a key to your agent and try again.")
                 }
             })?;
-            let (_agent, result) = session.authenticate_future(username.to_string(), key, agent).await;
-            result.map_err(|e| anyhow::anyhow!("SSH agent authentication failed: {}", e))?
+            // Extract the public key from the agent identity for authenticate_publickey_with.
+            let public_key = identity.public_key().into_owned();
+            session
+                .authenticate_publickey_with(username, public_key, None, &mut agent)
+                .await
+                .map_err(|e| anyhow::anyhow!("SSH agent authentication failed: {}", e))?
+                .success()
         }
     };
 
@@ -468,16 +503,22 @@ pub(crate) async fn connect_authenticated(
     Ok(session)
 }
 
+/// Select an agent identity based on an optional hint string.
+///
+/// In russh 0.61, `request_identities` returns `Vec<AgentIdentity>` (which may be
+/// a public key or a certificate) instead of `Vec<key::PublicKey>`. We compare
+/// against the base64 of the underlying public key to preserve the existing hint
+/// semantics.
 fn select_agent_identity(
-    identities: Vec<key::PublicKey>,
+    identities: Vec<russh::keys::agent::AgentIdentity>,
     identity_hint: Option<&str>,
-) -> Option<key::PublicKey> {
+) -> Option<russh::keys::agent::AgentIdentity> {
     let hint = identity_hint.map(str::trim).filter(|hint| !hint.is_empty());
 
     match hint {
         None => identities.into_iter().next(),
         Some(hint) => identities.into_iter().find(|identity| {
-            let encoded = identity.public_key_base64();
+            let encoded = identity.public_key().public_key_base64();
             encoded.contains(hint) || hint.contains(&encoded)
         }),
     }
@@ -534,7 +575,12 @@ pub(crate) fn expand_home_path(path: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn load_private_key(key_path: &str, passphrase: Option<&str>) -> Result<key::KeyPair> {
+/// Load a private key from disk, returning the russh 0.61 `PrivateKey` type
+/// (was `key::KeyPair` in older russh-keys).
+pub(crate) fn load_private_key(
+    key_path: &str,
+    passphrase: Option<&str>,
+) -> Result<russh::keys::PrivateKey> {
     let expanded = expand_home_path(key_path).ok_or_else(|| {
         anyhow::anyhow!(
             "Cannot resolve '~' in SSH key path '{}': home directory unknown.",
@@ -580,7 +626,8 @@ pub(crate) fn load_private_key(key_path: &str, passphrase: Option<&str>) -> Resu
         }
     }
 
-    load_secret_key(path, passphrase).map_err(|e| {
+    // load_secret_key lives in russh::keys in russh 0.61 (was from russh_keys:: wildcard).
+    russh::keys::load_secret_key(path, passphrase).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("encrypted") || msg.contains("passphrase") {
             anyhow::anyhow!(
@@ -634,7 +681,7 @@ impl SshClient {
                 passphrase,
             } => ResolvedAuth::Key {
                 key: Box::new(load_private_key(key_path, passphrase.as_deref())?),
-                key_path_hint: Some(key_path),
+                key_path_hint: Some(key_path.as_str()),
             },
             AuthMethod::Agent { identity_hint } => ResolvedAuth::Agent {
                 identity_hint: identity_hint.as_deref(),
@@ -1396,7 +1443,9 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         )
         .expect("expected key file to load successfully");
 
-        assert_eq!(key.name(), "ssh-ed25519");
+        // russh 0.61: PrivateKey uses algorithm() → Algorithm instead of name() → &str.
+        // Algorithm implements Display, producing the wire-format algorithm name.
+        assert_eq!(key.algorithm().to_string(), "ssh-ed25519");
     }
 }
 

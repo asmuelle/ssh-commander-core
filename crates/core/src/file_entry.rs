@@ -50,6 +50,10 @@ pub fn format_unix_timestamp(secs: i64) -> String {
 }
 
 /// Format Unix file permissions (mode bits) as a string like `rwxr-xr-x`.
+///
+/// Consumed by the SSH and SFTP directory-listing paths; a build with only
+/// the `ftp` or `postgres` feature compiles this module but doesn't call it.
+#[allow(dead_code)]
 pub(crate) fn format_permissions(mode: u32) -> String {
     let mut s = String::with_capacity(9);
     let flags = [

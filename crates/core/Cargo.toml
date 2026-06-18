@@ -18,7 +18,7 @@ categories = ["network-programming", "database", "asynchronous", "authentication
 default = ["ssh", "sftp", "ftp", "desktop", "tools", "postgres"]
 # SSH: interactive shell, exec, host-key TOFU, and the tunnel forwarder.
 # Pulls in russh + vendored OpenSSL (a heavy C build).
-ssh = ["dep:russh", "dep:russh-keys", "dep:russh-sftp"]
+ssh = ["dep:russh", "dep:russh-sftp"]
 # Standalone SFTP builds on the SSH transport, so it implies `ssh`.
 sftp = ["ssh"]
 # FTP / FTPS. Pulls in suppaftp + async-std.
@@ -46,8 +46,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
-russh = { version = "0.43", features = ["openssl", "vendored-openssl"], optional = true }
-russh-keys = { version = "0.43", features = ["vendored-openssl"], optional = true }
+russh = { version = "0.61", optional = true }
 russh-sftp = { version = "2", optional = true }
 anyhow = "1"
 thiserror = "2"
