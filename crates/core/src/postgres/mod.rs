@@ -16,12 +16,13 @@
 //! lifetime. Without that, opening cursor A then cursor B on the same
 //! wire kills A — what Sprint 5's single-cursor invariant produced.
 //!
-//! ## Tunnel sharing
+//! ## SSH tunneling
 //!
-//! When the profile uses an SSH tunnel, the listener is opened *once*
-//! at pool construction and shared by every pooled connection — they
-//! each open their own SSH `direct-tcpip` channel via the same local
-//! port. Single tunnel per profile keeps SSH session usage minimal.
+//! The pool dials `config.host:config.port` directly and knows nothing
+//! about SSH. When a profile needs an SSH tunnel, the caller (the
+//! `ConnectionManager`) opens one `SshTunnel`, points the `PgConfig` at
+//! its local forwarded port, and keeps the tunnel alive for the pool's
+//! lifetime. Single tunnel per profile keeps SSH session usage minimal.
 //!
 //! ## Thread safety
 //!
@@ -35,30 +36,26 @@ pub mod config;
 pub mod edit;
 pub mod exec;
 pub mod introspect;
-pub mod tunnel;
 
-pub use config::{PgAuthMethod, PgConfig, PgTlsMode, SshTunnelRef};
+pub use config::{PgAuthMethod, PgConfig, PgTlsMode};
 pub use edit::{InsertColumnInput, InsertedRow, UpdateOutcome};
 pub use exec::{ActiveCursor, ColumnMeta, ExecutionOutcome, PageResult};
 pub use introspect::{
     ColumnDetail, DbSummary, ObjectType, ObjectTypeKind, Relation, RelationKind, Routine,
     RoutineKind, SchemaContents, SchemaSummary, Sequence,
 };
-pub use tunnel::SshTunnel;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use rustls::ClientConfig as RustlsClientConfig;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_postgres::config::SslMode as PgSslMode;
 use tokio_postgres::{CancelToken, Client, Config as PgDriverConfig};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tokio_util::sync::CancellationToken;
-
-use crate::ssh::SshClient;
 
 /// Default upper bound on connections per pool. Five is plenty for an
 /// interactive explorer (you'd need six query tabs running at once to
@@ -126,11 +123,6 @@ pub enum PgError {
 
 pub struct PgPool {
     config: PgConfig,
-    /// Optional SSH tunnel shared across all pooled connections. The
-    /// listener stays bound for the pool's lifetime; per-connection
-    /// `direct-tcpip` channels open lazily as each connection
-    /// dials in.
-    tunnel: Option<Arc<SshTunnel>>,
     /// TLS connector built once at pool init and reused for every
     /// new connection plus every server-side cancel. Sharing
     /// matters for TLS-only Postgres deployments (RDS, Supabase,
@@ -237,33 +229,19 @@ impl PgPool {
     /// established) and `max_size = DEFAULT_MAX_POOL_SIZE`. Eager
     /// initial connect surfaces auth/network errors immediately
     /// rather than deferring them to the first query.
-    pub async fn connect(
-        cfg: PgConfig,
-        ssh_client: Option<Arc<RwLock<SshClient>>>,
-    ) -> Result<Arc<Self>, PgError> {
-        // Open the tunnel once if requested. Subsequent connections
-        // dial 127.0.0.1:<local_port> independently.
-        let tunnel: Option<Arc<SshTunnel>> = if let Some(tunnel_ref) = cfg.ssh_tunnel.as_ref() {
-            let Some(ssh) = ssh_client else {
-                return Err(PgError::Tunnel(
-                    "ssh tunnel requested but no ssh client supplied".into(),
-                ));
-            };
-            let t = SshTunnel::open(ssh, tunnel_ref.remote_host.clone(), tunnel_ref.remote_port)
-                .await
-                .map_err(|e| PgError::Tunnel(format!("failed to open ssh tunnel: {e}")))?;
-            Some(Arc::new(t))
-        } else {
-            None
-        };
-
+    ///
+    /// The pool dials `cfg.host:cfg.port` directly. To tunnel through SSH, the
+    /// caller (e.g. `ConnectionManager`) opens an `SshTunnel`, points `cfg` at
+    /// its local forwarded port, and keeps the tunnel alive for the pool's
+    /// lifetime — the pool itself has no knowledge of SSH.
+    pub async fn connect(cfg: PgConfig) -> Result<Arc<Self>, PgError> {
         // Build the TLS connector once. Subsequent opens (and the
         // initial open below) reuse it; so does `cancel`.
         let tls_connector = build_tls_connector(&cfg)?;
 
         // Eager-connect the first connection so authentication errors
         // surface up front.
-        let first = open_one(&cfg, tunnel.as_deref(), &tls_connector).await?;
+        let first = open_one(&cfg, &tls_connector).await?;
 
         let now = Instant::now();
         // Apply per-profile overrides on top of the built-in
@@ -285,7 +263,6 @@ impl PgPool {
 
         let pool = Arc::new(Self {
             config: cfg,
-            tunnel,
             tls_connector,
             inner: Mutex::new(PoolInner {
                 idle: vec![IdleEntry {
@@ -397,11 +374,11 @@ impl PgPool {
         self.reserve_connection_slot().await?;
 
         // Open a fresh connection bound to the target database.
-        // Reuse credentials, TLS posture, and tunnel — only the
+        // Reuse credentials and TLS posture — only the
         // database name differs.
         let mut cfg = self.config.clone();
         cfg.database = target.to_string();
-        let conn = match open_one(&cfg, self.tunnel.as_deref(), &self.tls_connector).await {
+        let conn = match open_one(&cfg, &self.tls_connector).await {
             Ok(conn) => conn,
             Err(e) => {
                 self.release_connection_slot().await;
@@ -689,7 +666,7 @@ impl PgPool {
                 inner.total += 1;
             }
             let new_conn =
-                match open_one(&self.config, self.tunnel.as_deref(), &self.tls_connector).await {
+                match open_one(&self.config, &self.tls_connector).await {
                     Ok(c) => c,
                     Err(e) => {
                         // Roll back the slot reservation on failure so
@@ -895,10 +872,9 @@ async fn run_eviction(pool: Weak<PgPool>, cancel: CancellationToken) {
 
 async fn open_one(
     cfg: &PgConfig,
-    tunnel: Option<&SshTunnel>,
     tls: &TlsConnectorKind,
 ) -> Result<PooledConnection, PgError> {
-    let driver_cfg = build_driver_config(cfg, tunnel)?;
+    let driver_cfg = build_driver_config(cfg)?;
     match tls {
         TlsConnectorKind::NoTls => {
             let (client, connection) = driver_cfg
@@ -934,16 +910,9 @@ fn build_tls_connector(cfg: &PgConfig) -> Result<TlsConnectorKind, PgError> {
     }
 }
 
-fn build_driver_config(
-    cfg: &PgConfig,
-    tunnel: Option<&SshTunnel>,
-) -> Result<PgDriverConfig, PgError> {
+fn build_driver_config(cfg: &PgConfig) -> Result<PgDriverConfig, PgError> {
     let mut driver = PgDriverConfig::new();
-    if let Some(t) = tunnel {
-        driver.host("127.0.0.1").port(t.local_port());
-    } else {
-        driver.host(&cfg.host).port(cfg.port);
-    }
+    driver.host(&cfg.host).port(cfg.port);
     driver.dbname(&cfg.database).user(&cfg.user);
 
     let password = match &cfg.auth {
@@ -1080,46 +1049,22 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
 mod tests {
     use super::*;
 
-    /// `PgPool::connect` rejects a tunneled config when no SSH client
-    /// is supplied. The macOS bridge always supplies one when the
-    /// config requests a tunnel; this guards against accidental
-    /// bypass in tests / library usage.
-    #[test]
-    fn pool_connect_with_tunnel_requires_ssh_client() {
-        let cfg = PgConfig {
-            ssh_tunnel: Some(SshTunnelRef {
-                ssh_connection_id: "ssh-1".to_string(),
-                remote_host: "db".to_string(),
-                remote_port: 5432,
-            }),
-            ..PgConfig::local("db", "u")
-        };
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        match rt.block_on(PgPool::connect(cfg, None)) {
-            Err(PgError::Tunnel(detail)) => {
-                assert!(detail.contains("ssh client"));
-            }
-            Err(other) => panic!("expected Tunnel error, got {other:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
     #[test]
     fn driver_config_uses_correct_ssl_mode() {
         let mut cfg = PgConfig::local("db", "u");
         cfg.tls = PgTlsMode::Require;
-        let driver = build_driver_config(&cfg, None).expect("driver cfg");
+        let driver = build_driver_config(&cfg).expect("driver cfg");
         assert!(matches!(driver.get_ssl_mode(), PgSslMode::Require));
 
         cfg.tls = PgTlsMode::Disable;
-        let driver = build_driver_config(&cfg, None).expect("driver cfg");
+        let driver = build_driver_config(&cfg).expect("driver cfg");
         assert!(matches!(driver.get_ssl_mode(), PgSslMode::Disable));
     }
 
     #[test]
     fn driver_config_omits_password_when_empty() {
         let cfg = PgConfig::local("db", "u");
-        let driver = build_driver_config(&cfg, None).expect("driver cfg");
+        let driver = build_driver_config(&cfg).expect("driver cfg");
         assert!(driver.get_password().is_none());
     }
 

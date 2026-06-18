@@ -49,14 +49,14 @@ pub use postgres::{
     ActiveCursor, BROWSER_SESSION_ID, ColumnDetail, ColumnMeta, DbSummary, ExecutionOutcome,
     InsertColumnInput, InsertedRow, ObjectType, ObjectTypeKind, PageResult, PgAuthMethod, PgConfig,
     PgError, PgPool, PgTlsMode, Relation, RelationKind, Routine, RoutineKind, SchemaContents,
-    SchemaSummary, Sequence, SshTunnelRef, UpdateOutcome,
+    SchemaSummary, Sequence, UpdateOutcome,
 };
 pub use sftp_client::{
     FileEntry, FileEntryType, RemoteFileEntry, SftpAuthMethod, SftpConfig, StandaloneSftpClient,
 };
 pub use ssh::{
     AuthMethod, CommandOutput, HostKeyMismatch, HostKeyStore, HostKeyStoreAccessError,
-    HostKeyVerificationFailure, PtySession, SshClient, SshConfig,
+    HostKeyVerificationFailure, PtySession, SshClient, SshConfig, SshTunnel, SshTunnelRef,
 };
 pub use tools::{
     DnsAnswer, DnsQuery, GitStatus, ListeningPort, TcpdumpEvent, TcpdumpRegistry, ToolsError,

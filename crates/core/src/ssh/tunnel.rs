@@ -1,4 +1,8 @@
-//! SSH local-port forwarding for the Postgres explorer.
+//! SSH local-port forwarding (`ssh -L`).
+//!
+//! Used by the Postgres explorer to tunnel a database connection through an
+//! SSH session, but the forwarder itself is protocol-agnostic and lives in the
+//! `ssh` module so the database layer needs no knowledge of SSH.
 //!
 //! Binds a local TCP listener on `127.0.0.1:<ephemeral>` and, for every
 //! inbound connection, opens a fresh `direct-tcpip` SSH channel to the
@@ -32,7 +36,26 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::ssh::SshClient;
+use serde::{Deserialize, Serialize};
+
+use super::SshClient;
+
+/// Reference to an existing `ConnectionManager`-managed SSH connection that
+/// should be used as a `direct-tcpip` tunnel for a Postgres connection.
+///
+/// Holding only the `connection_id` (rather than an `Arc<RwLock<SshClient>>`)
+/// keeps it purely data — the actual `SshClient` is resolved at connect time
+/// from the manager, so a tunnel can be re-established after SSH reconnect
+/// without rewriting the Postgres profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshTunnelRef {
+    /// `ConnectionManager` ID of the SSH connection to tunnel through.
+    pub ssh_connection_id: String,
+    /// Host to forward to, as seen from the SSH server.
+    pub remote_host: String,
+    /// Port to forward to, as seen from the SSH server.
+    pub remote_port: u16,
+}
 
 /// Live SSH local-forward to `(remote_host, remote_port)`.
 ///

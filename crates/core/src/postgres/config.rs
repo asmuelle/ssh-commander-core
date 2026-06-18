@@ -54,23 +54,6 @@ pub enum PgTlsMode {
     VerifyFull,
 }
 
-/// Reference to an existing `ConnectionManager`-managed SSH connection that
-/// should be used as a `direct-tcpip` tunnel for this Postgres connection.
-///
-/// Holding only the `connection_id` (rather than an `Arc<RwLock<SshClient>>`)
-/// keeps the config purely data — the actual `SshClient` is resolved at
-/// connect time from the manager, so a tunnel can be re-established after
-/// SSH reconnect without rewriting the Postgres profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SshTunnelRef {
-    /// `ConnectionManager` ID of the SSH connection to tunnel through.
-    pub ssh_connection_id: String,
-    /// Host to forward to, as seen from the SSH server.
-    pub remote_host: String,
-    /// Port to forward to, as seen from the SSH server.
-    pub remote_port: u16,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PgConfig {
     pub host: String,
@@ -84,10 +67,6 @@ pub struct PgConfig {
     /// `pg_stat_activity` so DBAs can identify connections from r-shell.
     #[serde(default)]
     pub application_name: Option<String>,
-    /// Optional SSH tunnel. When `Some`, the connection is established to
-    /// `127.0.0.1:<ephemeral>` after the tunnel is spliced.
-    #[serde(default)]
-    pub ssh_tunnel: Option<SshTunnelRef>,
     /// Connection timeout, seconds. `None` falls back to the driver default.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
@@ -123,7 +102,6 @@ impl PgConfig {
             },
             tls: PgTlsMode::Disable,
             application_name: Some("r-shell".to_string()),
-            ssh_tunnel: None,
             connect_timeout_secs: Some(10),
             max_pool_size: None,
             idle_timeout_secs: None,
@@ -145,7 +123,6 @@ mod tests {
         assert_eq!(cfg.user, "alice");
         assert_eq!(cfg.tls, PgTlsMode::Disable);
         assert_eq!(cfg.application_name.as_deref(), Some("r-shell"));
-        assert!(cfg.ssh_tunnel.is_none());
     }
 
     #[test]
@@ -165,11 +142,6 @@ mod tests {
             },
             tls: PgTlsMode::VerifyFull,
             application_name: Some("r-shell".to_string()),
-            ssh_tunnel: Some(SshTunnelRef {
-                ssh_connection_id: "ssh-1".to_string(),
-                remote_host: "db.internal".to_string(),
-                remote_port: 5432,
-            }),
             connect_timeout_secs: Some(15),
             max_pool_size: Some(10),
             idle_timeout_secs: Some(120),
@@ -179,7 +151,6 @@ mod tests {
         let back: PgConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.host, cfg.host);
         assert_eq!(back.tls, cfg.tls);
-        assert!(back.ssh_tunnel.is_some());
         assert_eq!(back.max_pool_size, Some(10));
         assert_eq!(back.idle_timeout_secs, Some(120));
         assert_eq!(back.min_idle_connections, Some(0));

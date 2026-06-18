@@ -3,7 +3,7 @@ use crate::ftp_client::FtpClient;
 use crate::postgres::{PgConfig, PgPool};
 use crate::rdp_client::RdpClient;
 use crate::sftp_client::StandaloneSftpClient;
-use crate::ssh::{HostKeyStore, PtySession, SshClient, SshConfig};
+use crate::ssh::{HostKeyStore, PtySession, SshClient, SshConfig, SshTunnel, SshTunnelRef};
 use crate::vnc_client::VncClient;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -54,8 +54,14 @@ pub enum ManagedConnection {
     },
     /// `PgPool` is internally `Sync` (manages its own locks), so no
     /// outer `RwLock` is needed here — multiple sessions / tabs can
-    /// hit the pool concurrently from independent tasks.
-    Postgres(Arc<PgPool>),
+    /// hit the pool concurrently from independent tasks. `tunnel` holds
+    /// the SSH local-forward open for the pool's lifetime when the
+    /// profile connects through one; the pool itself dials its local
+    /// port and is unaware of SSH.
+    Postgres {
+        pool: Arc<PgPool>,
+        tunnel: Option<Arc<SshTunnel>>,
+    },
 }
 
 impl ManagedConnection {
@@ -65,7 +71,7 @@ impl ManagedConnection {
             ManagedConnection::Sftp(_) => ProtocolKind::Sftp,
             ManagedConnection::Ftp(_) => ProtocolKind::Ftp,
             ManagedConnection::Desktop { kind, .. } => *kind,
-            ManagedConnection::Postgres(_) => ProtocolKind::Postgres,
+            ManagedConnection::Postgres { .. } => ProtocolKind::Postgres,
         }
     }
 }
@@ -98,7 +104,9 @@ impl ConnectionSlotKind {
             ConnectionSlotKind::Desktop => {
                 matches!(connection, ManagedConnection::Desktop { .. })
             }
-            ConnectionSlotKind::Postgres => matches!(connection, ManagedConnection::Postgres(_)),
+            ConnectionSlotKind::Postgres => {
+                matches!(connection, ManagedConnection::Postgres { .. })
+            }
         }
     }
 }
@@ -208,7 +216,7 @@ impl ConnectionManager {
     pub async fn get_postgres_pool(&self, id: &str) -> Option<Arc<PgPool>> {
         let connections = self.connections.read().await;
         match connections.get(id) {
-            Some(ManagedConnection::Postgres(c)) => Some(c.clone()),
+            Some(ManagedConnection::Postgres { pool, .. }) => Some(pool.clone()),
             _ => None,
         }
     }
@@ -280,8 +288,10 @@ impl ConnectionManager {
                 let mut client = client.write().await;
                 client.disconnect().await?;
             }
-            ManagedConnection::Postgres(pool) => {
+            ManagedConnection::Postgres { pool, .. } => {
                 pool.shutdown().await;
+                // `tunnel` (if any) is dropped with the ManagedConnection,
+                // cancelling the SSH local-forward accept loop.
             }
         }
         Ok(())
@@ -615,37 +625,55 @@ impl ConnectionManager {
     pub async fn create_postgres_connection(
         &self,
         connection_id: String,
-        config: PgConfig,
+        mut config: PgConfig,
+        tunnel: Option<SshTunnelRef>,
     ) -> Result<()> {
-        // Tunneled configs need an already-open SSH connection in this
-        // same manager. Resolve it up front so a missing source is a
-        // single typed error instead of failing partway through connect.
-        let ssh_client = if let Some(tunnel) = config.ssh_tunnel.as_ref() {
-            match self.get_connection(&tunnel.ssh_connection_id).await {
-                Some(c) => Some(c),
+        // The tunnel seam lives here, not in the pool: if the profile
+        // routes through SSH, this manager owns the already-open SSH
+        // connection, so it stands up the `direct-tcpip` local forward
+        // and points the pool's `PgConfig` at the loopback end. The
+        // Postgres layer dials a plain host:port and has no knowledge of
+        // SSH. Resolve the source up front so a missing one is a single
+        // typed error rather than a partial connect.
+        let tunnel_guard = if let Some(t) = tunnel {
+            let ssh_client = match self.get_connection(&t.ssh_connection_id).await {
+                Some(c) => c,
                 None => {
                     return Err(anyhow::Error::from(
                         crate::postgres::PgError::TunnelSourceMissing(format!(
                             "ssh connection '{}' is not registered or has been closed",
-                            tunnel.ssh_connection_id
+                            t.ssh_connection_id
                         )),
                     ));
                 }
-            }
+            };
+            let opened = SshTunnel::open(ssh_client, t.remote_host.clone(), t.remote_port)
+                .await
+                .map_err(|e| anyhow::Error::from(crate::postgres::PgError::Tunnel(e.to_string())))?;
+            // Redirect the pool at the local end of the forward.
+            config.host = "127.0.0.1".to_string();
+            config.port = opened.local_port();
+            Some(Arc::new(opened))
         } else {
             None
         };
 
         let cancel_token = self.register_pending_connection(&connection_id).await;
         let connect_result = tokio::select! {
-            res = PgPool::connect(config, ssh_client) => res.map_err(anyhow::Error::from),
+            res = PgPool::connect(config) => res.map_err(anyhow::Error::from),
             _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Connection cancelled by user")),
         };
         self.clear_pending_connection(&connection_id).await;
 
         let pool = connect_result?;
-        self.replace_managed_connection(connection_id, ManagedConnection::Postgres(pool))
-            .await
+        self.replace_managed_connection(
+            connection_id,
+            ManagedConnection::Postgres {
+                pool,
+                tunnel: tunnel_guard,
+            },
+        )
+        .await
     }
 
     pub async fn close_postgres_connection(&self, connection_id: &str) -> Result<()> {

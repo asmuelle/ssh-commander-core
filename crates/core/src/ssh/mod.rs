@@ -16,10 +16,12 @@ use tokio_util::sync::CancellationToken;
 
 pub mod host_keys;
 pub mod shell;
+pub mod tunnel;
 pub use host_keys::{
     HostKeyMismatch, HostKeyStore, HostKeyStoreAccessError, HostKeyVerificationFailure, Verdict,
     VerificationFailureSlot,
 };
+pub use tunnel::{SshTunnel, SshTunnelRef};
 
 /// Chunk size used for streaming SFTP transfers. 32 KiB balances throughput
 /// against memory overhead for concurrent transfers. Larger sizes hit

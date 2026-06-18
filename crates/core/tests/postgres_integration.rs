@@ -21,7 +21,6 @@ fn pg_config() -> Option<PgConfig> {
         auth: PgAuthMethod::Password { password },
         tls: PgTlsMode::Disable,
         application_name: Some("ssh-commander-core-tests".to_string()),
-        ssh_tunnel: None,
         connect_timeout_secs: Some(5),
         max_pool_size: Some(3),
         idle_timeout_secs: Some(1),
@@ -34,7 +33,7 @@ async fn pool() -> Option<std::sync::Arc<PgPool>> {
         eprintln!("SKIP: PG_TEST_HOST not set");
         return None;
     };
-    Some(PgPool::connect(cfg, None).await.expect("connect postgres"))
+    Some(PgPool::connect(cfg).await.expect("connect postgres"))
 }
 
 #[tokio::test]
