@@ -1,4 +1,4 @@
-use crate::sftp_client::{
+use crate::file_entry::{
     FileEntryType, RemoteFileEntry, format_permissions, format_unix_timestamp,
 };
 use anyhow::Result;
@@ -27,7 +27,7 @@ pub use tunnel::{SshTunnel, SshTunnelRef};
 /// against memory overhead for concurrent transfers. Larger sizes hit
 /// diminishing returns because SFTP's window management caps effective
 /// pipelining anyway.
-pub const SFTP_CHUNK_SIZE: usize = 32 * 1024;
+pub const SFTP_CHUNK_SIZE: usize = crate::file_entry::FILE_TRANSFER_CHUNK_SIZE;
 
 /// Preferred host-key algorithms advertised to the server, ordered from most to
 /// least preferred.  RSA variants (including the legacy `ssh-rsa` / SHA-1) are
