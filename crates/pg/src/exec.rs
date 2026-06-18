@@ -456,6 +456,16 @@ pub async fn open_query(
     if let Err(e) = client.batch_execute(&begin).await {
         // Make sure we don't leak a half-open transaction.
         let _ = client.batch_execute("ROLLBACK").await;
+        // Some row-returning statements cannot be wrapped in a cursor —
+        // notably `INSERT/UPDATE/DELETE ... RETURNING`, which `prepare`
+        // reports as having columns yet `DECLARE CURSOR FOR` rejects with
+        // SQLSTATE 42601. The DECLARE fails at parse time, so the statement
+        // itself never ran: re-run it directly via `simple_query` and
+        // return its rows as a single, non-paginated page.
+        if e.code() == Some(&tokio_postgres::error::SqlState::SYNTAX_ERROR) {
+            let outcome = run_multi_statement(client, sql, page_size).await?;
+            return Ok((outcome, None));
+        }
         return Err(PgError::Driver(e));
     }
 

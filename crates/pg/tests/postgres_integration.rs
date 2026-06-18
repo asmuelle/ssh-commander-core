@@ -36,6 +36,62 @@ async fn pool() -> Option<std::sync::Arc<PgPool>> {
     Some(PgPool::connect(cfg).await.expect("connect postgres"))
 }
 
+/// `execute` must handle row-returning statements that cannot be wrapped in
+/// a server-side cursor — `INSERT/UPDATE/DELETE ... RETURNING`. `prepare`
+/// reports columns for them, so the cursor path is attempted and
+/// `DECLARE CURSOR FOR INSERT ... RETURNING` fails with SQLSTATE 42601;
+/// open_query must fall back to a direct run and still return the RETURNING
+/// row(s). Regression for the grid-DML-as-text path.
+#[tokio::test]
+async fn execute_returning_dml_falls_back_from_cursor_path() {
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let table = format!("ret_{}", Uuid::new_v4().simple());
+    pool.execute(
+        "ret",
+        &format!("CREATE TABLE public.{table} (id int4, label text)"),
+        10,
+    )
+    .await
+    .expect("create");
+
+    // INSERT ... RETURNING as the very first statement.
+    let ins = pool
+        .execute(
+            "ret",
+            &format!(
+                "INSERT INTO public.{table} (id, label) VALUES (1, 'a') RETURNING id, ctid::text"
+            ),
+            10,
+        )
+        .await
+        .expect("insert returning");
+    assert_eq!(ins.rows.len(), 1, "RETURNING row must come back");
+    assert_eq!(ins.rows[0][0].as_deref(), Some("1"));
+    assert!(ins.cursor_id.is_none(), "non-cursorable: no cursor handle");
+
+    // And again while a cursor from a prior paginated SELECT is still open
+    // on the same session (the exact sequence the grid editor produces).
+    pool.execute("ret", &format!("SELECT id FROM public.{table}"), 1)
+        .await
+        .expect("paginated select opens a cursor");
+    let upd = pool
+        .execute(
+            "ret",
+            &format!("UPDATE public.{table} SET label = 'b' WHERE id = 1 RETURNING ctid::text"),
+            10,
+        )
+        .await
+        .expect("update returning after open cursor");
+    assert_eq!(upd.rows.len(), 1);
+
+    pool.execute("ret", &format!("DROP TABLE public.{table}"), 10)
+        .await
+        .ok();
+    pool.shutdown().await;
+}
+
 #[tokio::test]
 async fn pg_sleep_can_be_cancelled_promptly() {
     let Some(pool) = pool().await else {
