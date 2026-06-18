@@ -126,8 +126,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Only the leaf crates can be dry-run-published in regular CI.
+      # `cargo publish --dry-run` resolves workspace-internal path deps
+      # against the crates.io index, so a dependent crate
+      # (ssh-commander-pg → keychain, ssh-commander-core → pg + keychain)
+      # cannot be verified until its deps' matching version is published.
+      # The dependents' packaging is exercised by release.yml, which
+      # publishes the whole graph in dependency order.
       matrix:
-        crate: [ssh-commander-core, ssh-commander-pg-parquet]
+        crate: [ssh-commander-keychain, ssh-commander-pg-parquet]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
