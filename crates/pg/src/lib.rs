@@ -917,8 +917,8 @@ fn build_driver_config(cfg: &PgConfig) -> Result<PgDriverConfig, PgError> {
 
     let password = match &cfg.auth {
         PgAuthMethod::Password { password } => password.clone(),
-        PgAuthMethod::Keychain { account } => crate::keychain::load_password(
-            crate::keychain::CredentialKind::PostgresPassword,
+        PgAuthMethod::Keychain { account } => ssh_commander_keychain::load_password(
+            ssh_commander_keychain::CredentialKind::PostgresPassword,
             account,
         )
         .map_err(|e| PgError::Auth(format!("keychain load failed for {account}: {e}")))?

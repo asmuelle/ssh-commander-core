@@ -1,0 +1,26 @@
+[package]
+name = "ssh-commander-keychain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "macOS Keychain credential storage for ssh-commander-core. A small synchronous leaf crate shared by the SSH and PostgreSQL layers."
+documentation = "https://docs.rs/ssh-commander-keychain"
+readme = "../../README.md"
+keywords = ["keychain", "macos", "credentials", "security", "password"]
+categories = ["authentication", "os::macos-apis"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+
+[dev-dependencies]
+serde_json = "1"

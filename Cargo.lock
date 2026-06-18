@@ -2916,14 +2916,40 @@ dependencies = [
  "russh",
  "russh-keys",
  "russh-sftp",
- "rustls",
- "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "ssh-commander-keychain",
+ "ssh-commander-pg",
+ "suppaftp",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "ssh-commander-keychain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "security-framework",
  "security-framework-sys",
  "serde",
  "serde_json",
- "suppaftp",
- "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "ssh-commander-pg"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "ssh-commander-keychain",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",

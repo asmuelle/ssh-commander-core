@@ -39,7 +39,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
-use crate::postgres::PgError;
+use crate::PgError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateOutcome {

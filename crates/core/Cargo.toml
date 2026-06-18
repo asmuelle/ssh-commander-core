@@ -14,6 +14,13 @@ keywords = ["ssh", "sftp", "ftp", "postgres", "tunnel"]
 categories = ["network-programming", "database", "asynchronous", "authentication"]
 
 [dependencies]
+# Sibling crates: the PostgreSQL layer and the shared Keychain leaf.
+# `ssh-commander-pg` already depends on `ssh-commander-keychain`; core
+# also depends on keychain directly so it can re-export the credential
+# API under `ssh_commander_core::keychain` for FFI consumers.
+ssh-commander-pg = { path = "../pg", version = "0.1.0" }
+ssh-commander-keychain = { path = "../keychain", version = "0.1.0" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -31,18 +38,6 @@ async-std = "1"
 dirs = "5"
 rand = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-# Postgres database explorer (Sprint 1: connect + introspect)
-tokio-postgres = { version = "0.7", features = ["runtime", "with-chrono-0_4"] }
-tokio-postgres-rustls = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-native-certs = "0.8"
-# Used for cursor identifiers (Sprint 5: cursor pagination).
-uuid = { version = "1", features = ["v4"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3"
-security-framework-sys = "2"
 
 [dev-dependencies]
 proptest = "1"

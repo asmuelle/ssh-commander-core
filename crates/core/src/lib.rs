@@ -26,8 +26,6 @@
 pub mod connection_manager;
 pub mod desktop_protocol;
 pub mod ftp_client;
-pub mod keychain;
-pub mod postgres;
 pub mod rdp_client;
 pub mod sftp_client;
 pub mod ssh;
@@ -42,6 +40,14 @@ pub use desktop_protocol::{
     RdpConfig, VncConfig,
 };
 pub use event_bus::CoreEvent;
+
+// The PostgreSQL layer and Keychain credential store live in sibling
+// crates. Re-export them as modules so existing consumers keep using
+// `ssh_commander_core::postgres::*` / `ssh_commander_core::keychain::*`,
+// alongside the flat re-exports below.
+pub use ssh_commander_keychain as keychain;
+pub use ssh_commander_pg as postgres;
+
 pub use keychain::{
     CredentialKind, delete_password, is_supported, list_accounts, load_password, save_password,
 };

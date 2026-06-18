@@ -1,7 +1,7 @@
 use std::env;
 use std::time::Duration;
 
-use ssh_commander_core::postgres::{InsertColumnInput, PgAuthMethod, PgConfig, PgPool, PgTlsMode};
+use ssh_commander_pg::{InsertColumnInput, PgAuthMethod, PgConfig, PgPool, PgTlsMode};
 use uuid::Uuid;
 
 fn pg_config() -> Option<PgConfig> {

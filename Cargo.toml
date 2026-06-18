@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/keychain",
+    "crates/pg",
     "crates/pg-parquet",
 ]
 

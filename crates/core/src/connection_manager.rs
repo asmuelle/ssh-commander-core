@@ -1,6 +1,6 @@
 use crate::desktop_protocol::{DesktopConnectRequest, DesktopProtocol, FrameUpdate};
 use crate::ftp_client::FtpClient;
-use crate::postgres::{PgConfig, PgPool};
+use ssh_commander_pg::{PgConfig, PgPool};
 use crate::rdp_client::RdpClient;
 use crate::sftp_client::StandaloneSftpClient;
 use crate::ssh::{HostKeyStore, PtySession, SshClient, SshConfig, SshTunnel, SshTunnelRef};
@@ -640,7 +640,7 @@ impl ConnectionManager {
                 Some(c) => c,
                 None => {
                     return Err(anyhow::Error::from(
-                        crate::postgres::PgError::TunnelSourceMissing(format!(
+                        ssh_commander_pg::PgError::TunnelSourceMissing(format!(
                             "ssh connection '{}' is not registered or has been closed",
                             t.ssh_connection_id
                         )),
@@ -649,7 +649,7 @@ impl ConnectionManager {
             };
             let opened = SshTunnel::open(ssh_client, t.remote_host.clone(), t.remote_port)
                 .await
-                .map_err(|e| anyhow::Error::from(crate::postgres::PgError::Tunnel(e.to_string())))?;
+                .map_err(|e| anyhow::Error::from(ssh_commander_pg::PgError::Tunnel(e.to_string())))?;
             // Redirect the pool at the local end of the forward.
             config.host = "127.0.0.1".to_string();
             config.port = opened.local_port();
