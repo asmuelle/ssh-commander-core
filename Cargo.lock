@@ -3177,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-commander-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-std",
@@ -3203,7 +3203,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-commander-keychain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "security-framework",
@@ -3215,7 +3215,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-commander-pg"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "proptest",
  "rustls",
@@ -3234,7 +3234,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-commander-pg-parquet"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
