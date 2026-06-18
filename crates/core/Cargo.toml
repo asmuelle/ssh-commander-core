@@ -37,10 +37,10 @@ postgres = ["dep:ssh-commander-pg"]
 # Shared Keychain leaf crate — always present so core can re-export the
 # credential API under `ssh_commander_core::keychain` regardless of which
 # protocol features are enabled.
-ssh-commander-keychain = { path = "../keychain", version = "0.1.0" }
+ssh-commander-keychain = { path = "../keychain", version = "0.2.0" }
 # PostgreSQL layer — optional, behind the `postgres` feature. It already
 # depends on ssh-commander-keychain itself.
-ssh-commander-pg = { path = "../pg", version = "0.1.0", optional = true }
+ssh-commander-pg = { path = "../pg", version = "0.2.0", optional = true }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
