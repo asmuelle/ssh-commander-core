@@ -1,7 +1,17 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # rsa: Marvin timing side-channel. No fixed release exists; pulled in
+    # transitively via russh 0.61 → ssh-key → rsa for RSA key support.
+    # Low practical risk for an interactive SSH client; revisit when the
+    # rsa crate ships a constant-time fix.
+    "RUSTSEC-2023-0071",
+    # Unmaintained / unsound transitive deps with no actionable upgrade path:
+    "RUSTSEC-2025-0052", # async-std discontinued (via the `ftp` feature → suppaftp)
+    "RUSTSEC-2024-0436", # paste no longer maintained (deep transitive)
+    "RUSTSEC-2026-0097", # rand unsoundness in a custom-logger edge case (transitive)
+]
 
 [licenses]
 version = 2

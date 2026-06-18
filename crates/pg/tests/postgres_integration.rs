@@ -200,8 +200,24 @@ async fn typed_insert_update_and_delete_round_trip() {
         .expect("update numeric cell");
     assert_eq!(updated.rows_affected, 1);
 
+    // An UPDATE moves the row to a new heap tuple, so its ctid changes
+    // (Postgres MVCC). The pre-update ctid no longer matches any live row,
+    // so re-read the current ctid before deleting.
+    let refetched = pool
+        .execute(
+            "edit",
+            &format!("SELECT ctid::text FROM public.{table} WHERE id = 1"),
+            10,
+        )
+        .await
+        .expect("re-read ctid after update");
+    let current_ctid = refetched.rows[0][0]
+        .as_deref()
+        .expect("row still present with a ctid")
+        .to_string();
+
     let deleted = pool
-        .delete_rows("edit", "public", &table, &[ctid])
+        .delete_rows("edit", "public", &table, &[current_ctid])
         .await
         .expect("delete row");
     assert_eq!(deleted.rows_affected, 1);
