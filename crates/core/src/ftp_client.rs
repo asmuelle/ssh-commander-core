@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::sftp_client::{FileEntry, FileEntryType};
+use crate::file_entry::{FileEntry, FileEntryType};
 
 /// Configuration for an FTP/FTPS connection.
 #[derive(Clone, Deserialize)]
@@ -229,7 +229,7 @@ impl FtpClient {
                     .map_err(|e| anyhow::anyhow!("Failed to download file '{}': {}", remote, e))?;
             let mut local_file = std::fs::File::create(&local)
                 .map_err(|e| anyhow::anyhow!("Failed to create local file '{}': {}", local, e))?;
-            let mut buf = vec![0u8; crate::ssh::SFTP_CHUNK_SIZE];
+            let mut buf = vec![0u8; crate::file_entry::FILE_TRANSFER_CHUNK_SIZE];
             let mut total = 0u64;
             loop {
                 let n = data_stream
@@ -267,7 +267,7 @@ impl FtpClient {
                     .map_err(|e| anyhow::anyhow!("Failed to open upload stream: {}", e))?;
             let mut local_file = std::fs::File::open(&local)
                 .map_err(|e| anyhow::anyhow!("Failed to open local file '{}': {}", local, e))?;
-            let mut buf = vec![0u8; crate::ssh::SFTP_CHUNK_SIZE];
+            let mut buf = vec![0u8; crate::file_entry::FILE_TRANSFER_CHUNK_SIZE];
             let mut total = 0u64;
             loop {
                 let n = local_file

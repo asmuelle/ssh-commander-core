@@ -39,7 +39,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Client;
 
-use crate::postgres::PgError;
+use crate::PgError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateOutcome {
@@ -64,14 +64,20 @@ pub async fn update_cell(
     let qualified = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let col = quote_ident(column);
 
-    // ctid is bound as text and cast server-side. The standard text
-    // form `(0,1)` is what Postgres returns from `SELECT ctid`, so
-    // round-tripping through the UI as a String just works.
+    // ctid is bound as text and cast server-side via `::text::tid`. The
+    // intermediate `::text` is required: with a bare `$N::tid`, Postgres
+    // infers the parameter's own type as `tid`, and tokio-postgres
+    // (postgres-types >= 0.2.14) then rejects the `&str` bind with
+    // `WrongType { postgres: Tid, rust: "&str" }`. Forcing the parameter
+    // to `text` first lets the `&str` bind, then casts to `tid`
+    // server-side. The standard text form `(0,1)` is what Postgres
+    // returns from `SELECT ctid`, so round-tripping as a String just
+    // works. (The delete path already double-casts via `::text[]::tid[]`.)
     let rows_affected = match new_value {
         Some(value) => {
             let ty = validate_type_expression(column_type)?;
             let sql = format!(
-                "UPDATE {qualified} SET {col} = $1::text::{ty} WHERE ctid = $2::tid",
+                "UPDATE {qualified} SET {col} = $1::text::{ty} WHERE ctid = $2::text::tid",
                 qualified = qualified,
                 col = col,
                 ty = ty,
@@ -83,7 +89,7 @@ pub async fn update_cell(
         }
         None => {
             let sql = format!(
-                "UPDATE {qualified} SET {col} = NULL WHERE ctid = $1::tid",
+                "UPDATE {qualified} SET {col} = NULL WHERE ctid = $1::text::tid",
                 qualified = qualified,
                 col = col,
             );

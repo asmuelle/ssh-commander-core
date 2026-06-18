@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p ssh-commander-core --test postgres_integration -- --nocapture
+      - run: cargo test -p ssh-commander-pg --test postgres_integration -- --nocapture
 
   docs:
     name: rustdoc
@@ -97,7 +97,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      - run: cargo audit
+      # Ignored advisories mirror deny.toml's [advisories].ignore — all are
+      # unfixable transitive deps (rsa Marvin timing; async-std/paste
+      # unmaintained; rand unsound edge case). See deny.toml for rationale.
+      - run: >-
+          cargo audit
+          --ignore RUSTSEC-2023-0071
+          --ignore RUSTSEC-2025-0052
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2026-0097
       - run: cargo deny check advisories bans licenses sources
 
   coverage:
@@ -126,8 +134,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Only the leaf crates can be dry-run-published in regular CI.
+      # `cargo publish --dry-run` resolves workspace-internal path deps
+      # against the crates.io index, so a dependent crate
+      # (ssh-commander-pg → keychain, ssh-commander-core → pg + keychain)
+      # cannot be verified until its deps' matching version is published.
+      # The dependents' packaging is exercised by release.yml, which
+      # publishes the whole graph in dependency order.
       matrix:
-        crate: [ssh-commander-core, ssh-commander-pg-parquet]
+        crate: [ssh-commander-keychain, ssh-commander-pg-parquet]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

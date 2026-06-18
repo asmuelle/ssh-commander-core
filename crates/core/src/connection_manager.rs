@@ -1,14 +1,24 @@
+#[cfg(feature = "desktop")]
 use crate::desktop_protocol::{DesktopConnectRequest, DesktopProtocol, FrameUpdate};
+#[cfg(feature = "ftp")]
 use crate::ftp_client::FtpClient;
-use crate::postgres::{PgConfig, PgPool};
+#[cfg(feature = "desktop")]
 use crate::rdp_client::RdpClient;
+#[cfg(feature = "sftp")]
 use crate::sftp_client::StandaloneSftpClient;
+#[cfg(feature = "ssh")]
 use crate::ssh::{HostKeyStore, PtySession, SshClient, SshConfig};
+#[cfg(all(feature = "postgres", feature = "ssh"))]
+use crate::ssh::{SshTunnel, SshTunnelRef};
+#[cfg(feature = "desktop")]
 use crate::vnc_client::VncClient;
 use anyhow::Result;
+#[cfg(feature = "postgres")]
+use ssh_commander_pg::{PgConfig, PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+#[cfg(feature = "desktop")]
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -18,22 +28,34 @@ use tokio_util::sync::CancellationToken;
 /// a connection is exhaustiveness-checked and callers can't typo a tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolKind {
+    #[cfg(feature = "ssh")]
     Ssh,
+    #[cfg(feature = "sftp")]
     Sftp,
+    #[cfg(feature = "ftp")]
     Ftp,
+    #[cfg(feature = "desktop")]
     Rdp,
+    #[cfg(feature = "desktop")]
     Vnc,
+    #[cfg(feature = "postgres")]
     Postgres,
 }
 
 impl ProtocolKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            #[cfg(feature = "ssh")]
             ProtocolKind::Ssh => "SSH",
+            #[cfg(feature = "sftp")]
             ProtocolKind::Sftp => "SFTP",
+            #[cfg(feature = "ftp")]
             ProtocolKind::Ftp => "FTP",
+            #[cfg(feature = "desktop")]
             ProtocolKind::Rdp => "RDP",
+            #[cfg(feature = "desktop")]
             ProtocolKind::Vnc => "VNC",
+            #[cfg(feature = "postgres")]
             ProtocolKind::Postgres => "POSTGRES",
         }
     }
@@ -45,60 +67,109 @@ impl ProtocolKind {
 /// granularity, instead of a global map-level RwLock that would serialise
 /// every operation across unrelated connections.
 pub enum ManagedConnection {
+    #[cfg(feature = "ssh")]
     Ssh(Arc<RwLock<SshClient>>),
+    #[cfg(feature = "sftp")]
     Sftp(Arc<RwLock<StandaloneSftpClient>>),
+    #[cfg(feature = "ftp")]
     Ftp(Arc<RwLock<FtpClient>>),
+    #[cfg(feature = "desktop")]
     Desktop {
         kind: ProtocolKind, // Rdp or Vnc
         client: Arc<RwLock<Box<dyn DesktopProtocol>>>,
     },
     /// `PgPool` is internally `Sync` (manages its own locks), so no
     /// outer `RwLock` is needed here — multiple sessions / tabs can
-    /// hit the pool concurrently from independent tasks.
-    Postgres(Arc<PgPool>),
+    /// hit the pool concurrently from independent tasks. `tunnel` holds
+    /// the SSH local-forward open for the pool's lifetime when the
+    /// profile connects through one; the pool itself dials its local
+    /// port and is unaware of SSH.
+    #[cfg(feature = "postgres")]
+    Postgres {
+        pool: Arc<PgPool>,
+        #[cfg(feature = "ssh")]
+        tunnel: Option<Arc<SshTunnel>>,
+    },
 }
 
 impl ManagedConnection {
     pub fn kind(&self) -> ProtocolKind {
         match self {
+            #[cfg(feature = "ssh")]
             ManagedConnection::Ssh(_) => ProtocolKind::Ssh,
+            #[cfg(feature = "sftp")]
             ManagedConnection::Sftp(_) => ProtocolKind::Sftp,
+            #[cfg(feature = "ftp")]
             ManagedConnection::Ftp(_) => ProtocolKind::Ftp,
+            #[cfg(feature = "desktop")]
             ManagedConnection::Desktop { kind, .. } => *kind,
-            ManagedConnection::Postgres(_) => ProtocolKind::Postgres,
+            #[cfg(feature = "postgres")]
+            ManagedConnection::Postgres { .. } => ProtocolKind::Postgres,
         }
     }
 }
 
+#[cfg(any(
+    feature = "ssh",
+    feature = "sftp",
+    feature = "ftp",
+    feature = "desktop",
+    feature = "postgres"
+))]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // some variants only exist under specific feature sets
 enum ConnectionSlotKind {
+    #[cfg(feature = "ssh")]
     Ssh,
+    #[cfg(feature = "sftp")]
     Sftp,
+    #[cfg(feature = "ftp")]
     Ftp,
+    #[cfg(feature = "desktop")]
     Desktop,
+    #[cfg(feature = "postgres")]
     Postgres,
 }
 
+#[cfg(any(
+    feature = "ssh",
+    feature = "sftp",
+    feature = "ftp",
+    feature = "desktop",
+    feature = "postgres"
+))]
 impl ConnectionSlotKind {
     fn label(self) -> &'static str {
         match self {
+            #[cfg(feature = "ssh")]
             ConnectionSlotKind::Ssh => "SSH",
+            #[cfg(feature = "sftp")]
             ConnectionSlotKind::Sftp => "SFTP",
+            #[cfg(feature = "ftp")]
             ConnectionSlotKind::Ftp => "FTP",
+            #[cfg(feature = "desktop")]
             ConnectionSlotKind::Desktop => "desktop",
+            #[cfg(feature = "postgres")]
             ConnectionSlotKind::Postgres => "postgres",
         }
     }
 
     fn matches(self, connection: &ManagedConnection) -> bool {
         match self {
+            #[cfg(feature = "ssh")]
             ConnectionSlotKind::Ssh => matches!(connection, ManagedConnection::Ssh(_)),
+            #[cfg(feature = "sftp")]
             ConnectionSlotKind::Sftp => matches!(connection, ManagedConnection::Sftp(_)),
+            #[cfg(feature = "ftp")]
             ConnectionSlotKind::Ftp => matches!(connection, ManagedConnection::Ftp(_)),
+            #[cfg(feature = "desktop")]
             ConnectionSlotKind::Desktop => {
                 matches!(connection, ManagedConnection::Desktop { .. })
             }
-            ConnectionSlotKind::Postgres => matches!(connection, ManagedConnection::Postgres(_)),
+            #[cfg(feature = "postgres")]
+            ConnectionSlotKind::Postgres => {
+                matches!(connection, ManagedConnection::Postgres { .. })
+            }
         }
     }
 }
@@ -109,12 +180,17 @@ impl ConnectionSlotKind {
 /// hashmap contains the id") are now enforced by the variant tag itself.
 pub struct ConnectionManager {
     connections: Arc<RwLock<HashMap<String, ManagedConnection>>>,
+    /// PTY session state — only present when the SSH feature is enabled,
+    /// since interactive shells are an SSH-only capability.
+    #[cfg(feature = "ssh")]
     pty_sessions: Arc<RwLock<HashMap<String, Arc<PtySession>>>>,
     /// Generation counter per connection_id — incremented on each StartPty.
     /// Used to prevent a stale Close from killing a newly created session.
+    #[cfg(feature = "ssh")]
     pty_generations: Arc<RwLock<HashMap<String, u64>>>,
     pending_connections: Arc<RwLock<HashMap<String, CancellationToken>>>,
     /// Shared TOFU host-key store used by every SSH/SFTP connection.
+    #[cfg(feature = "ssh")]
     host_keys: Arc<HostKeyStore>,
 }
 
@@ -125,10 +201,22 @@ impl Default for ConnectionManager {
 }
 
 impl ConnectionManager {
+    #[cfg(feature = "ssh")]
     pub fn new() -> Self {
         Self::with_host_keys(Arc::new(HostKeyStore::new(HostKeyStore::default_path())))
     }
 
+    /// Construct a manager for a build without the SSH feature. There is
+    /// no host-key store or PTY state to initialise.
+    #[cfg(not(feature = "ssh"))]
+    pub fn new() -> Self {
+        Self {
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            pending_connections: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(feature = "ssh")]
     pub fn with_host_keys(host_keys: Arc<HostKeyStore>) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
@@ -142,6 +230,7 @@ impl ConnectionManager {
     /// Access the shared host-key store. Used by the macOS bridge to
     /// expose `forget` over FFI for the "Trust new key" flow on a
     /// `HostKeyMismatch`.
+    #[cfg(feature = "ssh")]
     pub fn host_keys(&self) -> Arc<HostKeyStore> {
         self.host_keys.clone()
     }
@@ -170,6 +259,7 @@ impl ConnectionManager {
     }
 
     /// Return the SSH client for a connection if it is an SSH connection.
+    #[cfg(feature = "ssh")]
     pub async fn get_connection(&self, id: &str) -> Option<Arc<RwLock<SshClient>>> {
         let connections = self.connections.read().await;
         match connections.get(id) {
@@ -178,6 +268,7 @@ impl ConnectionManager {
         }
     }
 
+    #[cfg(feature = "sftp")]
     pub async fn get_sftp_client(&self, id: &str) -> Option<Arc<RwLock<StandaloneSftpClient>>> {
         let connections = self.connections.read().await;
         match connections.get(id) {
@@ -186,6 +277,7 @@ impl ConnectionManager {
         }
     }
 
+    #[cfg(feature = "ftp")]
     pub async fn get_ftp_client(&self, id: &str) -> Option<Arc<RwLock<FtpClient>>> {
         let connections = self.connections.read().await;
         match connections.get(id) {
@@ -194,6 +286,7 @@ impl ConnectionManager {
         }
     }
 
+    #[cfg(feature = "desktop")]
     pub async fn get_desktop_connection(
         &self,
         id: &str,
@@ -205,10 +298,11 @@ impl ConnectionManager {
         }
     }
 
+    #[cfg(feature = "postgres")]
     pub async fn get_postgres_pool(&self, id: &str) -> Option<Arc<PgPool>> {
         let connections = self.connections.read().await;
         match connections.get(id) {
-            Some(ManagedConnection::Postgres(c)) => Some(c.clone()),
+            Some(ManagedConnection::Postgres { pool, .. }) => Some(pool.clone()),
             _ => None,
         }
     }
@@ -217,6 +311,7 @@ impl ConnectionManager {
     // SSH connection lifecycle (supports cancellation of a pending connect)
     // =========================================================================
 
+    #[cfg(feature = "ssh")]
     pub async fn create_connection(&self, connection_id: String, config: SshConfig) -> Result<()> {
         let mut client = SshClient::new(self.host_keys.clone());
         let cancel_token = self.register_pending_connection(&connection_id).await;
@@ -236,6 +331,9 @@ impl ConnectionManager {
         .await
     }
 
+    // Cancellable-connect bookkeeping is only exercised by the SSH and
+    // Postgres connect paths; a build without either does not need it.
+    #[cfg(any(feature = "ssh", feature = "postgres"))]
     async fn register_pending_connection(&self, connection_id: &str) -> CancellationToken {
         let token = CancellationToken::new();
         let mut pending = self.pending_connections.write().await;
@@ -243,17 +341,26 @@ impl ConnectionManager {
         token
     }
 
+    #[cfg(any(feature = "ssh", feature = "postgres"))]
     async fn clear_pending_connection(&self, connection_id: &str) {
         let mut pending = self.pending_connections.write().await;
         pending.remove(connection_id);
     }
 
+    #[cfg(any(
+        feature = "ssh",
+        feature = "sftp",
+        feature = "ftp",
+        feature = "desktop",
+        feature = "postgres"
+    ))]
     async fn disconnect_managed_connection(
         &self,
         connection_id: &str,
         connection: ManagedConnection,
     ) -> Result<()> {
         match connection {
+            #[cfg(feature = "ssh")]
             ManagedConnection::Ssh(client) => {
                 {
                     let mut pty_sessions = self.pty_sessions.write().await;
@@ -268,25 +375,41 @@ impl ConnectionManager {
                 let mut client = client.write().await;
                 client.disconnect().await?;
             }
+            #[cfg(feature = "sftp")]
             ManagedConnection::Sftp(client) => {
                 let mut client = client.write().await;
                 client.disconnect().await?;
             }
+            #[cfg(feature = "ftp")]
             ManagedConnection::Ftp(client) => {
                 let mut client = client.write().await;
                 client.disconnect().await?;
             }
+            #[cfg(feature = "desktop")]
             ManagedConnection::Desktop { client, .. } => {
                 let mut client = client.write().await;
                 client.disconnect().await?;
             }
-            ManagedConnection::Postgres(pool) => {
+            #[cfg(feature = "postgres")]
+            ManagedConnection::Postgres { pool, .. } => {
                 pool.shutdown().await;
+                // `tunnel` (if any) is dropped with the ManagedConnection,
+                // cancelling the SSH local-forward accept loop.
             }
         }
+        // `connection_id` is unused when no protocol arm consumes it (e.g.
+        // a postgres-only build), so keep it referenced to avoid a warning.
+        let _ = connection_id;
         Ok(())
     }
 
+    #[cfg(any(
+        feature = "ssh",
+        feature = "sftp",
+        feature = "ftp",
+        feature = "desktop",
+        feature = "postgres"
+    ))]
     async fn replace_managed_connection(
         &self,
         connection_id: String,
@@ -307,6 +430,13 @@ impl ConnectionManager {
         Ok(())
     }
 
+    #[cfg(any(
+        feature = "ssh",
+        feature = "sftp",
+        feature = "ftp",
+        feature = "desktop",
+        feature = "postgres"
+    ))]
     async fn take_connection_if_kind(
         &self,
         connection_id: &str,
@@ -342,6 +472,7 @@ impl ConnectionManager {
     /// Close the SSH connection for `connection_id` (if it is SSH). Also tears
     /// down any associated PTY session and prunes the generation counter so it
     /// cannot leak across reconnects.
+    #[cfg(feature = "ssh")]
     pub async fn close_connection(&self, connection_id: &str) -> Result<()> {
         if let Some(connection) = self
             .take_connection_if_kind(connection_id, ConnectionSlotKind::Ssh)
@@ -359,6 +490,7 @@ impl ConnectionManager {
 
     /// Start a PTY shell connection (like ttyd does).
     /// Enables interactive commands: vim, less, more, top, htop, etc.
+    #[cfg(feature = "ssh")]
     pub async fn start_pty_connection(
         &self,
         connection_id: &str,
@@ -403,6 +535,7 @@ impl ConnectionManager {
     ///
     /// Backpressure: if the input channel is full we await `send`, preserving
     /// keystroke order.
+    #[cfg(feature = "ssh")]
     pub async fn write_to_pty(&self, connection_id: &str, data: Vec<u8>) -> Result<()> {
         let tx = {
             let pty_sessions = self.pty_sessions.read().await;
@@ -422,12 +555,14 @@ impl ConnectionManager {
     /// to the session's `output_rx` for the lifetime of that PTY, even if
     /// `start_pty_connection` is later called again for the same connection
     /// (which would replace the entry in `pty_sessions`).
+    #[cfg(feature = "ssh")]
     pub async fn get_pty_session(&self, connection_id: &str) -> Option<Arc<PtySession>> {
         self.pty_sessions.read().await.get(connection_id).cloned()
     }
 
     /// Read a burst of PTY output — blocks until data arrives, then drains any
     /// additional already-queued chunks up to `max_bytes`.
+    #[cfg(feature = "ssh")]
     pub async fn read_pty_burst(&self, connection_id: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let pty = {
             let pty_sessions = self.pty_sessions.read().await;
@@ -456,6 +591,7 @@ impl ConnectionManager {
     }
 
     /// Close PTY connection, but only if the generation matches.
+    #[cfg(feature = "ssh")]
     pub async fn close_pty_connection(
         &self,
         connection_id: &str,
@@ -482,12 +618,14 @@ impl ConnectionManager {
     }
 
     /// Get the cancellation token for a PTY session (used by WebSocket reader tasks).
+    #[cfg(feature = "ssh")]
     pub async fn get_pty_cancel_token(&self, connection_id: &str) -> Option<CancellationToken> {
         let sessions = self.pty_sessions.read().await;
         sessions.get(connection_id).map(|s| s.cancel.clone())
     }
 
     /// Resize PTY terminal (send window-change to remote SSH channel)
+    #[cfg(feature = "ssh")]
     pub async fn resize_pty(&self, connection_id: &str, cols: u32, rows: u32) -> Result<()> {
         let pty_sessions = self.pty_sessions.read().await;
         let pty = pty_sessions
@@ -504,6 +642,7 @@ impl ConnectionManager {
     // Standalone SFTP
     // =========================================================================
 
+    #[cfg(feature = "sftp")]
     pub async fn create_sftp_connection(
         &self,
         connection_id: String,
@@ -517,6 +656,7 @@ impl ConnectionManager {
         .await
     }
 
+    #[cfg(feature = "sftp")]
     pub async fn close_sftp_connection(&self, connection_id: &str) -> Result<()> {
         if let Some(connection) = self
             .take_connection_if_kind(connection_id, ConnectionSlotKind::Sftp)
@@ -532,6 +672,7 @@ impl ConnectionManager {
     // FTP / FTPS
     // =========================================================================
 
+    #[cfg(feature = "ftp")]
     pub async fn create_ftp_connection(
         &self,
         connection_id: String,
@@ -545,6 +686,7 @@ impl ConnectionManager {
         .await
     }
 
+    #[cfg(feature = "ftp")]
     pub async fn close_ftp_connection(&self, connection_id: &str) -> Result<()> {
         if let Some(connection) = self
             .take_connection_if_kind(connection_id, ConnectionSlotKind::Ftp)
@@ -560,6 +702,7 @@ impl ConnectionManager {
     // Remote desktop (RDP / VNC)
     // =========================================================================
 
+    #[cfg(feature = "desktop")]
     pub async fn create_desktop_connection(
         &self,
         connection_id: String,
@@ -597,6 +740,7 @@ impl ConnectionManager {
         Ok((w, h))
     }
 
+    #[cfg(feature = "desktop")]
     pub async fn close_desktop_connection(&self, connection_id: &str) -> Result<()> {
         if let Some(connection) = self
             .take_connection_if_kind(connection_id, ConnectionSlotKind::Desktop)
@@ -612,42 +756,87 @@ impl ConnectionManager {
     // Postgres
     // =========================================================================
 
+    /// Open a Postgres pool, optionally tunneled through an SSH connection
+    /// this manager already owns. Available when both `postgres` and `ssh`
+    /// features are enabled.
+    #[cfg(all(feature = "postgres", feature = "ssh"))]
     pub async fn create_postgres_connection(
         &self,
         connection_id: String,
-        config: PgConfig,
+        mut config: PgConfig,
+        tunnel: Option<SshTunnelRef>,
     ) -> Result<()> {
-        // Tunneled configs need an already-open SSH connection in this
-        // same manager. Resolve it up front so a missing source is a
-        // single typed error instead of failing partway through connect.
-        let ssh_client = if let Some(tunnel) = config.ssh_tunnel.as_ref() {
-            match self.get_connection(&tunnel.ssh_connection_id).await {
-                Some(c) => Some(c),
+        // The tunnel seam lives here, not in the pool: if the profile
+        // routes through SSH, this manager owns the already-open SSH
+        // connection, so it stands up the `direct-tcpip` local forward
+        // and points the pool's `PgConfig` at the loopback end. The
+        // Postgres layer dials a plain host:port and has no knowledge of
+        // SSH. Resolve the source up front so a missing one is a single
+        // typed error rather than a partial connect.
+        let tunnel_guard = if let Some(t) = tunnel {
+            let ssh_client = match self.get_connection(&t.ssh_connection_id).await {
+                Some(c) => c,
                 None => {
                     return Err(anyhow::Error::from(
-                        crate::postgres::PgError::TunnelSourceMissing(format!(
+                        ssh_commander_pg::PgError::TunnelSourceMissing(format!(
                             "ssh connection '{}' is not registered or has been closed",
-                            tunnel.ssh_connection_id
+                            t.ssh_connection_id
                         )),
                     ));
                 }
-            }
+            };
+            let opened = SshTunnel::open(ssh_client, t.remote_host.clone(), t.remote_port)
+                .await
+                .map_err(|e| {
+                    anyhow::Error::from(ssh_commander_pg::PgError::Tunnel(e.to_string()))
+                })?;
+            // Redirect the pool at the local end of the forward.
+            config.host = "127.0.0.1".to_string();
+            config.port = opened.local_port();
+            Some(Arc::new(opened))
         } else {
             None
         };
 
         let cancel_token = self.register_pending_connection(&connection_id).await;
         let connect_result = tokio::select! {
-            res = PgPool::connect(config, ssh_client) => res.map_err(anyhow::Error::from),
+            res = PgPool::connect(config) => res.map_err(anyhow::Error::from),
             _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Connection cancelled by user")),
         };
         self.clear_pending_connection(&connection_id).await;
 
         let pool = connect_result?;
-        self.replace_managed_connection(connection_id, ManagedConnection::Postgres(pool))
+        self.replace_managed_connection(
+            connection_id,
+            ManagedConnection::Postgres {
+                pool,
+                tunnel: tunnel_guard,
+            },
+        )
+        .await
+    }
+
+    /// Open a Postgres pool. This build has no SSH feature, so there is no
+    /// tunnel option — the pool connects directly to `config`'s host:port.
+    #[cfg(all(feature = "postgres", not(feature = "ssh")))]
+    pub async fn create_postgres_connection(
+        &self,
+        connection_id: String,
+        config: PgConfig,
+    ) -> Result<()> {
+        let cancel_token = self.register_pending_connection(&connection_id).await;
+        let connect_result = tokio::select! {
+            res = PgPool::connect(config) => res.map_err(anyhow::Error::from),
+            _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Connection cancelled by user")),
+        };
+        self.clear_pending_connection(&connection_id).await;
+
+        let pool = connect_result?;
+        self.replace_managed_connection(connection_id, ManagedConnection::Postgres { pool })
             .await
     }
 
+    #[cfg(feature = "postgres")]
     pub async fn close_postgres_connection(&self, connection_id: &str) -> Result<()> {
         if let Some(connection) = self
             .take_connection_if_kind(connection_id, ConnectionSlotKind::Postgres)
@@ -664,6 +853,7 @@ impl ConnectionManager {
     /// Not yet wired up to the WebSocket server — kept here so the RDP/VNC
     /// stubs have a concrete dispatch point once the protocol clients gain
     /// real implementations. Remove the allow once a caller appears.
+    #[cfg(feature = "desktop")]
     #[allow(dead_code)]
     pub async fn start_desktop_stream(
         &self,
@@ -686,10 +876,13 @@ impl ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "desktop", feature = "ssh"))]
     use async_trait::async_trait;
 
+    #[cfg(all(feature = "desktop", feature = "ssh"))]
     struct TestDesktopClient;
 
+    #[cfg(all(feature = "desktop", feature = "ssh"))]
     #[async_trait]
     impl DesktopProtocol for TestDesktopClient {
         async fn start_frame_loop(
@@ -729,6 +922,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "ssh", feature = "desktop"))]
     fn disconnected_ssh_client() -> SshClient {
         SshClient::new(Arc::new(HostKeyStore::new(
             std::env::temp_dir().join("r-shell-test-known-hosts"),
@@ -756,14 +950,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_protocol_kind_round_trip() {
+        #[cfg(feature = "ssh")]
         assert_eq!(ProtocolKind::Ssh.as_str(), "SSH");
+        #[cfg(feature = "sftp")]
         assert_eq!(ProtocolKind::Sftp.as_str(), "SFTP");
+        #[cfg(feature = "ftp")]
         assert_eq!(ProtocolKind::Ftp.as_str(), "FTP");
+        #[cfg(feature = "desktop")]
         assert_eq!(ProtocolKind::Rdp.as_str(), "RDP");
+        #[cfg(feature = "desktop")]
         assert_eq!(ProtocolKind::Vnc.as_str(), "VNC");
+        #[cfg(feature = "postgres")]
         assert_eq!(ProtocolKind::Postgres.as_str(), "POSTGRES");
     }
 
+    #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn test_close_postgres_of_unknown_id_is_noop() {
         let mgr = ConnectionManager::new();
@@ -771,6 +972,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(feature = "sftp")]
     #[tokio::test]
     async fn test_close_sftp_of_unknown_id_is_noop() {
         let mgr = ConnectionManager::new();
@@ -778,6 +980,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(feature = "ftp")]
     #[tokio::test]
     async fn test_close_ftp_of_unknown_id_is_noop() {
         let mgr = ConnectionManager::new();
@@ -785,6 +988,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(all(feature = "ssh", feature = "desktop"))]
     #[tokio::test]
     async fn test_close_connection_rejects_non_ssh_without_removing_it() {
         let mgr = ConnectionManager::new();
@@ -810,6 +1014,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "ssh", feature = "desktop"))]
     #[tokio::test]
     async fn test_close_desktop_connection_rejects_ssh_without_removing_it() {
         let mgr = ConnectionManager::new();

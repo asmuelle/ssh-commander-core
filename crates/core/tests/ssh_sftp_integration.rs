@@ -1,3 +1,7 @@
+//! Exercises the SSH transport and standalone SFTP; only meaningful when
+//! both features are compiled in.
+#![cfg(all(feature = "ssh", feature = "sftp"))]
+
 use std::env;
 use std::sync::Arc;
 

@@ -1,7 +1,7 @@
 use std::env;
 use std::time::Duration;
 
-use ssh_commander_core::postgres::{InsertColumnInput, PgAuthMethod, PgConfig, PgPool, PgTlsMode};
+use ssh_commander_pg::{InsertColumnInput, PgAuthMethod, PgConfig, PgPool, PgTlsMode};
 use uuid::Uuid;
 
 fn pg_config() -> Option<PgConfig> {
@@ -21,7 +21,6 @@ fn pg_config() -> Option<PgConfig> {
         auth: PgAuthMethod::Password { password },
         tls: PgTlsMode::Disable,
         application_name: Some("ssh-commander-core-tests".to_string()),
-        ssh_tunnel: None,
         connect_timeout_secs: Some(5),
         max_pool_size: Some(3),
         idle_timeout_secs: Some(1),
@@ -34,7 +33,7 @@ async fn pool() -> Option<std::sync::Arc<PgPool>> {
         eprintln!("SKIP: PG_TEST_HOST not set");
         return None;
     };
-    Some(PgPool::connect(cfg, None).await.expect("connect postgres"))
+    Some(PgPool::connect(cfg).await.expect("connect postgres"))
 }
 
 #[tokio::test]
@@ -201,8 +200,24 @@ async fn typed_insert_update_and_delete_round_trip() {
         .expect("update numeric cell");
     assert_eq!(updated.rows_affected, 1);
 
+    // An UPDATE moves the row to a new heap tuple, so its ctid changes
+    // (Postgres MVCC). The pre-update ctid no longer matches any live row,
+    // so re-read the current ctid before deleting.
+    let refetched = pool
+        .execute(
+            "edit",
+            &format!("SELECT ctid::text FROM public.{table} WHERE id = 1"),
+            10,
+        )
+        .await
+        .expect("re-read ctid after update");
+    let current_ctid = refetched.rows[0][0]
+        .as_deref()
+        .expect("row still present with a ctid")
+        .to_string();
+
     let deleted = pool
-        .delete_rows("edit", "public", &table, &[ctid])
+        .delete_rows("edit", "public", &table, &[current_ctid])
         .await
         .expect("delete row");
     assert_eq!(deleted.rows_affected, 1);

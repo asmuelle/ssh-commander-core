@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::{Client, SimpleQueryMessage};
 use uuid::Uuid;
 
-use crate::postgres::PgError;
+use crate::PgError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnMeta {

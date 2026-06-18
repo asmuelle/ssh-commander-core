@@ -2,11 +2,13 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/keychain",
+    "crates/pg",
     "crates/pg-parquet",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Andreas Mueller <herban.mueller@gmail.com>"]
