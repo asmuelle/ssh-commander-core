@@ -433,20 +433,38 @@ pub(crate) async fn connect_authenticated(
             .success(),
         ResolvedAuth::Key { key, .. } => {
             // russh 0.61: authenticate_publickey takes PrivateKeyWithHashAlg
-            // instead of Arc<KeyPair>. Pass None for hash_alg so non-RSA keys
-            // use their natural algorithm and RSA falls back to SHA-1 (caller
-            // can upgrade by setting Some(HashAlg::Sha256) when desired).
-            let key_with_alg = russh::keys::key::PrivateKeyWithHashAlg::new(Arc::new(*key), None);
-            session
-                .authenticate_publickey(username, key_with_alg)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Public key authentication failed: {}. The key may not be authorized on the server.",
-                        e
-                    )
-                })?
-                .success()
+            // instead of Arc<KeyPair>. For RSA keys, hash_alg = None makes russh
+            // sign with SHA-1 (ssh-rsa), which OpenSSH >= 8.8 rejects by default
+            // — so we must offer the SHA-2 variants. Try SHA-512, then SHA-256,
+            // then SHA-1 for legacy servers. Non-RSA keys ignore the hash alg, so
+            // a single None attempt uses their natural algorithm.
+            let key = Arc::new(*key);
+            let hash_algs: &[Option<HashAlg>] =
+                if matches!(key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
+                    &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+                } else {
+                    &[None]
+                };
+
+            let mut authenticated = false;
+            for hash_alg in hash_algs.iter().copied() {
+                let key_with_alg =
+                    russh::keys::key::PrivateKeyWithHashAlg::new(key.clone(), hash_alg);
+                let auth = session
+                    .authenticate_publickey(username, key_with_alg)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Public key authentication failed: {}. The key may not be authorized on the server.",
+                            e
+                        )
+                    })?;
+                if auth.success() {
+                    authenticated = true;
+                    break;
+                }
+            }
+            authenticated
         }
         ResolvedAuth::Agent { identity_hint } => {
             // russh 0.61: authenticate_future is removed. Use authenticate_publickey_with,
