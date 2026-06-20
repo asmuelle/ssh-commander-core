@@ -118,3 +118,51 @@ async fn sftp_crud_smoke() {
     client.delete_dir(&remote_root).await.expect("delete dir");
     client.disconnect().await.expect("disconnect sftp");
 }
+
+/// Regression guard for SHA-1 RSA signatures. russh 0.61's
+/// `PrivateKeyWithHashAlg::new(key, None)` signs RSA keys with SHA-1 (ssh-rsa),
+/// which OpenSSH >= 8.8 rejects by default — connections silently failed with
+/// "Authentication failed ... using public key". The fix offers the SHA-2
+/// variants first. This connects with a real RSA key to prove SHA-2 is sent.
+///
+/// Set SSH_TEST_HOST, SSH_TEST_USER and SSH_TEST_KEY_PATH (path to an RSA
+/// private key authorized on the host) to run.
+#[tokio::test]
+async fn ssh_exec_with_rsa_key() {
+    let Ok(host) = env::var("SSH_TEST_HOST") else {
+        eprintln!("SKIP: SSH_TEST_HOST not set");
+        return;
+    };
+    let Ok(key_path) = env::var("SSH_TEST_KEY_PATH") else {
+        eprintln!("SKIP: SSH_TEST_KEY_PATH not set");
+        return;
+    };
+    let port = env::var("SSH_TEST_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(22);
+    let username = env::var("SSH_TEST_USER").unwrap_or_else(|_| "root".to_string());
+
+    let cfg = SshConfig {
+        host,
+        port,
+        username,
+        auth_method: AuthMethod::PublicKey {
+            key_path,
+            passphrase: env::var("SSH_TEST_KEY_PASSPHRASE").ok(),
+        },
+    };
+
+    let mut client = SshClient::new(host_keys());
+    client
+        .connect(&cfg)
+        .await
+        .expect("connect ssh with rsa key");
+    let out = client
+        .execute_command_full("printf 'rsa-ok'")
+        .await
+        .expect("exec command");
+    assert!(out.is_success(), "{out:?}");
+    assert_eq!(out.stdout, "rsa-ok");
+    client.disconnect().await.expect("disconnect ssh");
+}
