@@ -4,12 +4,9 @@ use russh_sftp::client::SftpSession;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::file_entry::{
-    FileEntryType, RemoteFileEntry, format_permissions, format_unix_timestamp,
-};
-use crate::ssh::{Client, HostKeyStore};
+use crate::file_entry::RemoteFileEntry;
+use crate::ssh::{Client, HostKeyStore, sftp_ops};
 
 /// Configuration for a standalone SFTP connection (SSH transport, no PTY).
 #[derive(Clone, Deserialize)]
@@ -138,178 +135,54 @@ impl StandaloneSftpClient {
     }
 
     // ===== File Operations =====
+    //
+    // All file operations delegate to `crate::ssh::sftp_ops`, the single
+    // implementation shared with `SshClient` — behavior and error messages
+    // stay identical across both SFTP entry points.
+
+    /// Borrow the live SFTP session or fail with a consistent
+    /// "not connected" error.
+    fn sftp(&self) -> Result<&SftpSession> {
+        self.sftp
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))
+    }
 
     /// List directory contents at `path`.
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        let entries = sftp
-            .read_dir(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list directory '{}': {}", path, e))?;
-
-        let mut result = Vec::new();
-        for entry in entries {
-            let name = entry.file_name();
-            // Skip . and .. entries
-            if name == "." || name == ".." {
-                continue;
-            }
-
-            let attrs = entry.metadata();
-            let size = attrs.size.unwrap_or(0);
-            let mtime_secs = attrs.mtime.map(|t| t as i64);
-            let modified = mtime_secs.map(format_unix_timestamp);
-
-            let permissions = attrs.permissions.map(format_permissions);
-            let owner = attrs.uid.map(|u| u.to_string());
-            let group = attrs.gid.map(|g| g.to_string());
-
-            let file_type = if attrs.is_dir() {
-                FileEntryType::Directory
-            } else if attrs.is_symlink() {
-                FileEntryType::Symlink
-            } else {
-                FileEntryType::File
-            };
-
-            result.push(RemoteFileEntry {
-                name,
-                size,
-                modified,
-                modified_unix: mtime_secs,
-                permissions,
-                owner,
-                group,
-                file_type,
-            });
-        }
-
-        // Sort: directories first, then by name
-        result.sort_by(|a, b| {
-            let a_is_dir = matches!(a.file_type, FileEntryType::Directory);
-            let b_is_dir = matches!(b.file_type, FileEntryType::Directory);
-            b_is_dir
-                .cmp(&a_is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-
-        Ok(result)
+        sftp_ops::list_dir(self.sftp()?, path).await
     }
 
     /// Download a remote file to a local path. Streams chunks — never buffers
     /// the whole file. Returns bytes downloaded.
     pub async fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        let mut remote_file = sftp
-            .open(remote_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open remote file '{}': {}", remote_path, e))?;
-        let mut local_file = tokio::fs::File::create(local_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create local file '{}': {}", local_path, e))?;
-
-        let mut buf = vec![0u8; crate::ssh::SFTP_CHUNK_SIZE];
-        let mut total_bytes = 0u64;
-        loop {
-            let n = remote_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            local_file.write_all(&buf[..n]).await?;
-            total_bytes += n as u64;
-        }
-        local_file.flush().await?;
-        Ok(total_bytes)
+        sftp_ops::download_file(self.sftp()?, remote_path, local_path, |_| {}, None).await
     }
 
     /// Upload a local file to a remote path. Streams chunks — never buffers
     /// the whole file. Returns bytes uploaded.
     pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        let mut local_file = tokio::fs::File::open(local_path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open local file '{}': {}", local_path, e))?;
-        let mut remote_file = sftp.create(remote_path).await.map_err(|e| {
-            anyhow::anyhow!("Failed to create remote file '{}': {}", remote_path, e)
-        })?;
-
-        let mut buf = vec![0u8; crate::ssh::SFTP_CHUNK_SIZE];
-        let mut total_bytes = 0u64;
-        loop {
-            let n = local_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            remote_file.write_all(&buf[..n]).await?;
-            total_bytes += n as u64;
-        }
-        remote_file.flush().await?;
-
-        Ok(total_bytes)
+        sftp_ops::upload_file(self.sftp()?, local_path, remote_path, |_| {}, None).await
     }
 
     /// Create a directory on the remote server.
     pub async fn create_dir(&self, path: &str) -> Result<()> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        sftp.create_dir(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create directory '{}': {}", path, e))?;
-        Ok(())
+        sftp_ops::create_dir(self.sftp()?, path).await
     }
 
     /// Rename a file or directory.
     pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        sftp.rename(old_path, new_path).await.map_err(|e| {
-            anyhow::anyhow!("Failed to rename '{}' to '{}': {}", old_path, new_path, e)
-        })?;
-        Ok(())
+        sftp_ops::rename(self.sftp()?, old_path, new_path).await
     }
 
     /// Delete a file on the remote server.
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        sftp.remove_file(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete file '{}': {}", path, e))?;
-        Ok(())
+        sftp_ops::delete_file(self.sftp()?, path).await
     }
 
     /// Delete a directory on the remote server.
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
-        let sftp = self
-            .sftp
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))?;
-
-        sftp.remove_dir(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete directory '{}': {}", path, e))?;
-        Ok(())
+        sftp_ops::delete_dir(self.sftp()?, path).await
     }
 }
 

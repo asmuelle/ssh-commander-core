@@ -1,6 +1,4 @@
-use crate::file_entry::{
-    FileEntryType, RemoteFileEntry, format_permissions, format_unix_timestamp,
-};
+use crate::file_entry::RemoteFileEntry;
 use anyhow::Result;
 use russh::keys::{HashAlg, PublicKeyBase64};
 use russh::*;
@@ -9,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub mod host_keys;
+pub(crate) mod sftp_ops;
 pub mod shell;
 pub mod tunnel;
 pub use host_keys::{
@@ -35,7 +34,7 @@ pub const SFTP_CHUNK_SIZE: usize = crate::file_entry::FILE_TRANSFER_CHUNK_SIZE;
 ///
 /// In russh 0.61, host-key algorithms are represented as `ssh_key::Algorithm`
 /// (re-exported at `russh::keys::Algorithm`) instead of the old `key::Name` constants.
-pub static PREFERRED_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
+pub(crate) static PREFERRED_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
     russh::keys::Algorithm::Ed25519,
     russh::keys::Algorithm::Ecdsa {
         curve: russh::keys::EcdsaCurve::NistP256,
@@ -60,7 +59,7 @@ pub static PREFERRED_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
 /// endpoints still require the SHA-1 variants and drop the TCP connection with
 /// "Connection reset by peer" during KEX if we don't offer them. Keeping the
 /// modern entries first means security-conscious servers still negotiate up.
-pub static PREFERRED_KEX_ALGOS: &[russh::kex::Name] = &[
+pub(crate) static PREFERRED_KEX_ALGOS: &[russh::kex::Name] = &[
     russh::kex::CURVE25519,
     russh::kex::CURVE25519_PRE_RFC_8731,
     russh::kex::DH_G16_SHA512,
@@ -181,6 +180,22 @@ impl CommandOutput {
     }
 }
 
+/// Opaque handle to an open `direct-tcpip` SSH channel, as returned by
+/// [`SshClient::open_direct_tcpip`]. Wraps the underlying russh channel so
+/// this crate's public API doesn't expose russh types — consumers only need
+/// the duplex byte stream.
+pub struct TunnelChannel(russh::Channel<client::Msg>);
+
+impl TunnelChannel {
+    /// Consume the channel and expose it as a duplex byte stream suitable
+    /// for splicing onto a local TCP socket.
+    pub fn into_stream(
+        self,
+    ) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static {
+        self.0.into_stream()
+    }
+}
+
 // PTY session handle for interactive shell
 pub struct PtySession {
     pub input_tx: mpsc::Sender<Vec<u8>>,
@@ -198,7 +213,7 @@ pub struct PtySession {
 /// TOFU-trusted and persisted. On `Verdict::Mismatch` the handshake is rejected
 /// and details are written to the shared verification-failure slot so the
 /// caller can build a descriptive user-facing error.
-pub struct Client {
+pub(crate) struct Client {
     host: String,
     port: u16,
     store: Arc<HostKeyStore>,
@@ -206,7 +221,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(
+    pub(crate) fn new(
         host: impl Into<String>,
         port: u16,
         store: Arc<HostKeyStore>,
@@ -897,18 +912,14 @@ impl SshClient {
     /// `originator_address`/`originator_port` are reported to the server
     /// for logging/auditing and may be `127.0.0.1:0` when the caller
     /// doesn't have a meaningful client endpoint to advertise.
-    pub async fn open_direct_tcpip(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Result<russh::Channel<russh::client::Msg>> {
+    pub async fn open_direct_tcpip(&self, host: &str, port: u16) -> Result<TunnelChannel> {
         let Some(session) = &self.session else {
             return Err(anyhow::anyhow!("Not connected"));
         };
         let channel = session
             .channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0)
             .await?;
-        Ok(channel)
+        Ok(TunnelChannel(channel))
     }
 
     /// Create a persistent PTY shell session (like ttyd)
@@ -1053,55 +1064,7 @@ impl SshClient {
 
     pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>> {
         let sftp = self.sftp_session().await?;
-        let entries = sftp
-            .read_dir(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list directory '{}': {}", path, e))?;
-
-        let mut result = Vec::new();
-        for entry in entries {
-            let name = entry.file_name();
-            if name == "." || name == ".." {
-                continue;
-            }
-
-            let attrs = entry.metadata();
-            let size = attrs.size.unwrap_or(0);
-            let mtime_secs = attrs.mtime.map(|t| t as i64);
-            let modified = mtime_secs.map(format_unix_timestamp);
-            let permissions = attrs.permissions.map(format_permissions);
-            let owner = attrs.uid.map(|u| u.to_string());
-            let group = attrs.gid.map(|g| g.to_string());
-
-            let file_type = if attrs.is_dir() {
-                FileEntryType::Directory
-            } else if attrs.is_symlink() {
-                FileEntryType::Symlink
-            } else {
-                FileEntryType::File
-            };
-
-            result.push(RemoteFileEntry {
-                name,
-                size,
-                modified,
-                modified_unix: mtime_secs,
-                permissions,
-                owner,
-                group,
-                file_type,
-            });
-        }
-
-        result.sort_by(|a, b| {
-            let a_is_dir = matches!(a.file_type, FileEntryType::Directory);
-            let b_is_dir = matches!(b.file_type, FileEntryType::Directory);
-            b_is_dir
-                .cmp(&a_is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
-
-        Ok(result)
+        sftp_ops::list_dir(&sftp, path).await
     }
 
     pub async fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64> {
@@ -1128,48 +1091,16 @@ impl SshClient {
         &self,
         remote_path: &str,
         local_path: &str,
-        mut progress: impl FnMut(u64),
+        progress: impl FnMut(u64),
         cancel: Option<&CancellationToken>,
     ) -> Result<u64> {
         let sftp = self.sftp_session().await?;
-        let mut remote_file = sftp.open(remote_path).await?;
-        let mut local_file = tokio::fs::File::create(local_path).await?;
-
-        let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
-        let mut total_bytes = 0u64;
-        loop {
-            if let Some(token) = cancel
-                && token.is_cancelled()
-            {
-                return Err(anyhow::anyhow!("Transfer cancelled"));
-            }
-            let n = remote_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            local_file.write_all(&buf[..n]).await?;
-            total_bytes += n as u64;
-            progress(total_bytes);
-        }
-        local_file.flush().await?;
-
-        Ok(total_bytes)
+        sftp_ops::download_file(&sftp, remote_path, local_path, progress, cancel).await
     }
 
     pub async fn download_file_to_memory(&self, remote_path: &str) -> Result<Vec<u8>> {
         let sftp = self.sftp_session().await?;
-        let mut remote_file = sftp.open(remote_path).await?;
-
-        let mut buffer = Vec::new();
-        let mut temp_buf = vec![0u8; SFTP_CHUNK_SIZE];
-        loop {
-            let n = remote_file.read(&mut temp_buf).await?;
-            if n == 0 {
-                break;
-            }
-            buffer.extend_from_slice(&temp_buf[..n]);
-        }
-        Ok(buffer)
+        sftp_ops::download_to_memory(&sftp, remote_path).await
     }
 
     pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64> {
@@ -1188,54 +1119,23 @@ impl SshClient {
         &self,
         local_path: &str,
         remote_path: &str,
-        mut progress: impl FnMut(u64),
+        progress: impl FnMut(u64),
         cancel: Option<&CancellationToken>,
     ) -> Result<u64> {
         let sftp = self.sftp_session().await?;
-        let mut local_file = tokio::fs::File::open(local_path).await?;
-        let mut remote_file = sftp.create(remote_path).await?;
-
-        let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
-        let mut total_bytes = 0u64;
-        loop {
-            if let Some(token) = cancel
-                && token.is_cancelled()
-            {
-                return Err(anyhow::anyhow!("Transfer cancelled"));
-            }
-            let n = local_file.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            remote_file.write_all(&buf[..n]).await?;
-            total_bytes += n as u64;
-            progress(total_bytes);
-        }
-        remote_file.flush().await?;
-
-        Ok(total_bytes)
+        sftp_ops::upload_file(&sftp, local_path, remote_path, progress, cancel).await
     }
 
     pub async fn upload_file_from_bytes(&self, data: &[u8], remote_path: &str) -> Result<u64> {
         let sftp = self.sftp_session().await?;
-        let mut remote_file = sftp.create(remote_path).await?;
-
-        for chunk in data.chunks(SFTP_CHUNK_SIZE) {
-            remote_file.write_all(chunk).await?;
-        }
-        remote_file.flush().await?;
-
-        Ok(data.len() as u64)
+        sftp_ops::upload_from_bytes(&sftp, data, remote_path).await
     }
 
     /// Create a directory on the remote. Fails if the parent doesn't
     /// exist or the path is already taken.
     pub async fn create_dir(&self, path: &str) -> Result<()> {
         let sftp = self.sftp_session().await?;
-        sftp.create_dir(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create directory '{}': {}", path, e))?;
-        Ok(())
+        sftp_ops::create_dir(&sftp, path).await
     }
 
     /// Rename a file or directory. SFTP RENAME is atomic when source
@@ -1243,19 +1143,13 @@ impl SshClient {
     /// renames may copy-then-delete depending on the server.
     pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         let sftp = self.sftp_session().await?;
-        sftp.rename(old_path, new_path).await.map_err(|e| {
-            anyhow::anyhow!("Failed to rename '{}' to '{}': {}", old_path, new_path, e)
-        })?;
-        Ok(())
+        sftp_ops::rename(&sftp, old_path, new_path).await
     }
 
     /// Delete a regular file. For directories, use `delete_dir`.
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         let sftp = self.sftp_session().await?;
-        sftp.remove_file(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete file '{}': {}", path, e))?;
-        Ok(())
+        sftp_ops::delete_file(&sftp, path).await
     }
 
     /// Delete an empty directory. SFTP requires the directory be empty;
@@ -1263,10 +1157,7 @@ impl SshClient {
     /// belongs at the caller layer (with progress reporting).
     pub async fn delete_dir(&self, path: &str) -> Result<()> {
         let sftp = self.sftp_session().await?;
-        sftp.remove_dir(path)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete directory '{}': {}", path, e))?;
-        Ok(())
+        sftp_ops::delete_dir(&sftp, path).await
     }
 }
 

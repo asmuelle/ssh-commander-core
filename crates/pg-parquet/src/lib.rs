@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -88,6 +88,17 @@ pub struct ParquetRegistry {
     exporters: Mutex<HashMap<u64, ParquetExporter>>,
 }
 
+/// Lock a registry mutex, recovering from poisoning. The registry is a
+/// process-wide singleton reachable from FFI: if a panic ever escaped while
+/// a lock was held, propagating the poison would permanently brick Parquet
+/// export for the rest of the process. The guarded state (an id counter and
+/// a map of writers) stays structurally valid across a panic — at worst one
+/// writer is left mid-batch and its file is truncated on close — so
+/// continuing is strictly better than failing every future export.
+fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl ParquetRegistry {
     pub fn global() -> &'static Self {
         static REGISTRY: OnceLock<ParquetRegistry> = OnceLock::new();
@@ -100,29 +111,23 @@ impl ParquetRegistry {
     pub fn open(&self, path: &Path, columns: &[String]) -> Result<u64, ParquetExportError> {
         let exporter = ParquetExporter::create(path, columns)?;
         let id = {
-            let mut next = self.next_id.lock().expect("registry poisoned");
+            let mut next = lock_recovering(&self.next_id);
             let id = *next;
             *next += 1;
             id
         };
-        self.exporters
-            .lock()
-            .expect("registry poisoned")
-            .insert(id, exporter);
+        lock_recovering(&self.exporters).insert(id, exporter);
         Ok(id)
     }
 
     pub fn append(&self, id: u64, rows: &[Vec<Option<String>>]) -> Result<(), ParquetExportError> {
-        let mut map = self.exporters.lock().expect("registry poisoned");
+        let mut map = lock_recovering(&self.exporters);
         let exporter = map.get_mut(&id).ok_or(ParquetExportError::UnknownWriter)?;
         exporter.append_rows(rows)
     }
 
     pub fn close(&self, id: u64) -> Result<(), ParquetExportError> {
-        let exporter = self
-            .exporters
-            .lock()
-            .expect("registry poisoned")
+        let exporter = lock_recovering(&self.exporters)
             .remove(&id)
             .ok_or(ParquetExportError::UnknownWriter)?;
         exporter.close()

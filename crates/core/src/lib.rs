@@ -93,6 +93,7 @@ pub use sftp_client::{SftpAuthMethod, SftpConfig, StandaloneSftpClient};
 pub use ssh::{
     AuthMethod, CommandOutput, HostKeyMismatch, HostKeyStore, HostKeyStoreAccessError,
     HostKeyVerificationFailure, PtySession, SshClient, SshConfig, SshTunnel, SshTunnelRef,
+    TunnelChannel,
 };
 #[cfg(feature = "tools")]
 pub use tools::{
