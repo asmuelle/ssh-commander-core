@@ -10,7 +10,6 @@ ignore = [
     # Unmaintained / unsound transitive deps with no actionable upgrade path:
     "RUSTSEC-2025-0052", # async-std discontinued (via the `ftp` feature → suppaftp)
     "RUSTSEC-2024-0436", # paste no longer maintained (deep transitive)
-    "RUSTSEC-2026-0097", # rand unsoundness in a custom-logger edge case (transitive)
 ]
 
 [licenses]
