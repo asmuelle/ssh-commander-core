@@ -365,7 +365,7 @@ impl ConnectionManager {
         let cancel_token = self.register_pending_connection(&connection_id).await;
 
         let connect_result = tokio::select! {
-            res = client.connect(&config) => res,
+            res = client.connect(&config) => res.map_err(anyhow::Error::from),
             _ = cancel_token.cancelled() => Err(anyhow::anyhow!("Connection cancelled by user")),
         };
 

@@ -1,4 +1,3 @@
-use anyhow::Result;
 use russh::*;
 use russh_sftp::client::SftpSession;
 use serde::Deserialize;
@@ -6,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::file_entry::RemoteFileEntry;
-use crate::ssh::{Client, HostKeyStore, sftp_ops};
+use crate::ssh::{Client, HostKeyStore, SshError, sftp_ops};
+use crate::transfer::TransferError;
 
 /// Configuration for a standalone SFTP connection (SSH transport, no PTY).
 #[derive(Clone, Deserialize)]
@@ -74,7 +74,10 @@ pub struct StandaloneSftpClient {
 
 impl StandaloneSftpClient {
     /// Establish an SSH connection, authenticate, and open the SFTP subsystem.
-    pub async fn connect(config: &SftpConfig, host_keys: Arc<HostKeyStore>) -> Result<Self> {
+    pub async fn connect(
+        config: &SftpConfig,
+        host_keys: Arc<HostKeyStore>,
+    ) -> Result<Self, SshError> {
         let auth = match &config.auth_method {
             SftpAuthMethod::Password { password } => {
                 crate::ssh::ResolvedAuth::Password { password }
@@ -103,9 +106,17 @@ impl StandaloneSftpClient {
         let session = Arc::new(ssh_session);
 
         // Open an SFTP subsystem channel (no PTY)
-        let channel = session.channel_open_session().await?;
-        channel.request_subsystem(true, "sftp").await?;
-        let sftp = SftpSession::new(channel.into_stream()).await?;
+        let channel = session
+            .channel_open_session()
+            .await
+            .map_err(SshError::transport)?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(SshError::transport)?;
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(SshError::transport)?;
 
         Ok(Self {
             session: Some(session),
@@ -113,7 +124,7 @@ impl StandaloneSftpClient {
         })
     }
 
-    pub async fn disconnect(&mut self) -> Result<()> {
+    pub async fn disconnect(&mut self) -> Result<(), SshError> {
         // Drop SFTP session first
         self.sftp.take();
         // Disconnect SSH session
@@ -142,46 +153,54 @@ impl StandaloneSftpClient {
 
     /// Borrow the live SFTP session or fail with a consistent
     /// "not connected" error.
-    fn sftp(&self) -> Result<&SftpSession> {
+    fn sftp(&self) -> Result<&SftpSession, TransferError> {
         self.sftp
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SFTP session not connected"))
+            .ok_or(TransferError::NotConnected("SFTP"))
     }
 
     /// List directory contents at `path`.
-    pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>> {
+    pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>, TransferError> {
         sftp_ops::list_dir(self.sftp()?, path).await
     }
 
     /// Download a remote file to a local path. Streams chunks — never buffers
     /// the whole file. Returns bytes downloaded.
-    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64> {
+    pub async fn download_file(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Result<u64, TransferError> {
         sftp_ops::download_file(self.sftp()?, remote_path, local_path, |_| {}, None).await
     }
 
     /// Upload a local file to a remote path. Streams chunks — never buffers
     /// the whole file. Returns bytes uploaded.
-    pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64> {
+    pub async fn upload_file(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<u64, TransferError> {
         sftp_ops::upload_file(self.sftp()?, local_path, remote_path, |_| {}, None).await
     }
 
     /// Create a directory on the remote server.
-    pub async fn create_dir(&self, path: &str) -> Result<()> {
+    pub async fn create_dir(&self, path: &str) -> Result<(), TransferError> {
         sftp_ops::create_dir(self.sftp()?, path).await
     }
 
     /// Rename a file or directory.
-    pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+    pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<(), TransferError> {
         sftp_ops::rename(self.sftp()?, old_path, new_path).await
     }
 
     /// Delete a file on the remote server.
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
+    pub async fn delete_file(&self, path: &str) -> Result<(), TransferError> {
         sftp_ops::delete_file(self.sftp()?, path).await
     }
 
     /// Delete a directory on the remote server.
-    pub async fn delete_dir(&self, path: &str) -> Result<()> {
+    pub async fn delete_dir(&self, path: &str) -> Result<(), TransferError> {
         sftp_ops::delete_dir(self.sftp()?, path).await
     }
 }

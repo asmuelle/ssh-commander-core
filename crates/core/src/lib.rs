@@ -58,6 +58,7 @@ pub mod tools;
 pub mod vnc_client;
 
 pub mod event_bus;
+pub mod transfer;
 
 pub use connection_manager::{ConnectionManager, ManagedConnection, ProtocolKind};
 #[cfg(feature = "desktop")]
@@ -67,6 +68,9 @@ pub use desktop_protocol::{
 };
 pub use event_bus::CoreEvent;
 pub use file_entry::{FileEntry, FileEntryType, RemoteFileEntry};
+#[cfg(feature = "ftp")]
+pub use ftp_client::{FtpClient, FtpConfig, FtpError};
+pub use transfer::TransferError;
 
 // The Keychain credential store lives in a sibling leaf crate; the
 // PostgreSQL layer (behind the `postgres` feature) in another. Re-export
@@ -92,8 +96,8 @@ pub use sftp_client::{SftpAuthMethod, SftpConfig, StandaloneSftpClient};
 #[cfg(feature = "ssh")]
 pub use ssh::{
     AuthMethod, CommandOutput, HostKeyMismatch, HostKeyStore, HostKeyStoreAccessError,
-    HostKeyVerificationFailure, PtySession, SshClient, SshConfig, SshTunnel, SshTunnelRef,
-    TunnelChannel,
+    HostKeyVerificationFailure, PtySession, SshClient, SshConfig, SshError, SshTunnel,
+    SshTunnelRef, TunnelChannel,
 };
 #[cfg(feature = "tools")]
 pub use tools::{

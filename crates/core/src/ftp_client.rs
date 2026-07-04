@@ -1,4 +1,3 @@
-use anyhow::Result;
 use async_std::io::ReadExt;
 use async_std::io::WriteExt as AsyncWriteExt;
 use serde::Deserialize;
@@ -6,6 +5,29 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::file_entry::{FileEntry, FileEntryType};
+use crate::transfer::TransferError;
+
+/// Typed errors for the FTP/FTPS connect path. File operations return
+/// [`TransferError`], shared with the SFTP clients.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FtpError {
+    /// TCP-level connect failure or timeout.
+    #[error("{message}")]
+    Connect { message: String },
+
+    /// FTPS TLS handshake failure.
+    #[error("{message}")]
+    Tls { message: String },
+
+    /// The server rejected the login.
+    #[error("{message}")]
+    Auth { message: String },
+
+    /// Post-login protocol failure (e.g. switching to binary mode).
+    #[error("{message}")]
+    Protocol { message: String },
+}
 
 /// Configuration for an FTP/FTPS connection.
 #[derive(Clone, Deserialize)]
@@ -35,7 +57,7 @@ macro_rules! ftp_stream {
         let kind = $self
             .stream
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("FTP session not connected"))?;
+            .ok_or(TransferError::NotConnected("FTP"))?;
         match kind {
             FtpStreamKind::Plain($s) => $body,
             FtpStreamKind::Secure($s) => $body,
@@ -50,7 +72,7 @@ pub struct FtpClient {
 
 impl FtpClient {
     /// Connect to an FTP server, authenticate, and switch to binary transfer mode.
-    pub async fn connect(config: &FtpConfig) -> Result<Self> {
+    pub async fn connect(config: &FtpConfig) -> Result<Self, FtpError> {
         let addr = format!("{}:{}", config.host, config.port);
 
         tracing::info!(
@@ -69,14 +91,15 @@ impl FtpClient {
                 suppaftp::AsyncNativeTlsFtpStream::connect(&addr),
             )
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+            .map_err(|_| FtpError::Connect {
+                message: format!(
                     "FTPS connection timed out after 15s. Check host {} and port {}.",
-                    config.host,
-                    config.port
-                )
+                    config.host, config.port
+                ),
             })?
-            .map_err(|e| anyhow::anyhow!("FTPS TCP connect to {} failed: {}", addr, e))?;
+            .map_err(|e| FtpError::Connect {
+                message: format!("FTPS TCP connect to {} failed: {}", addr, e),
+            })?;
 
             tracing::info!("FTPS TCP connected, starting TLS handshake...");
 
@@ -94,12 +117,12 @@ impl FtpClient {
                     &config.host,
                 )
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
+                .map_err(|e| FtpError::Tls {
+                    message: format!(
                         "FTPS TLS handshake failed: {}. \
                          If the server uses a self-signed certificate, re-connect with 'Allow invalid TLS certificates' enabled.",
                         e
-                    )
+                    ),
                 })?;
 
             tracing::info!("FTPS TLS handshake complete");
@@ -110,14 +133,15 @@ impl FtpClient {
                 suppaftp::AsyncFtpStream::connect(&addr),
             )
             .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+            .map_err(|_| FtpError::Connect {
+                message: format!(
                     "FTP connection timed out after 15s. Check host {} and port {}.",
-                    config.host,
-                    config.port
-                )
+                    config.host, config.port
+                ),
             })?
-            .map_err(|e| anyhow::anyhow!("FTP TCP connect to {} failed: {}", addr, e))?;
+            .map_err(|e| FtpError::Connect {
+                message: format!("FTP TCP connect to {} failed: {}", addr, e),
+            })?;
 
             tracing::info!("FTP TCP connected to {}", addr);
             FtpStreamKind::Plain(ftp_stream)
@@ -135,7 +159,9 @@ impl FtpClient {
                 FtpStreamKind::Plain(s) => s.login(user, pass).await,
                 FtpStreamKind::Secure(s) => s.login(user, pass).await,
             }
-            .map_err(|e| anyhow::anyhow!("FTP authentication failed for user '{}': {}", user, e))?;
+            .map_err(|e| FtpError::Auth {
+                message: format!("FTP authentication failed for user '{}': {}", user, e),
+            })?;
         }
 
         tracing::info!("FTP authenticated successfully");
@@ -148,7 +174,9 @@ impl FtpClient {
                     s.transfer_type(suppaftp::types::FileType::Binary).await
                 }
             }
-            .map_err(|e| anyhow::anyhow!("Failed to set binary transfer type: {}", e))?;
+            .map_err(|e| FtpError::Protocol {
+                message: format!("Failed to set binary transfer type: {}", e),
+            })?;
         }
 
         tracing::info!("FTP connection fully established to {}", addr);
@@ -158,7 +186,7 @@ impl FtpClient {
         })
     }
 
-    pub async fn disconnect(&mut self) -> Result<()> {
+    pub async fn disconnect(&mut self) -> Result<(), FtpError> {
         if let Some(kind) = self.stream.take() {
             match kind {
                 FtpStreamKind::Plain(mut s) => {
@@ -187,10 +215,10 @@ impl FtpClient {
     // ===== File Operations =====
 
     /// List directory contents at `path`.
-    pub async fn list_dir(&mut self, path: &str) -> Result<Vec<FileEntry>> {
+    pub async fn list_dir(&mut self, path: &str) -> Result<Vec<FileEntry>, TransferError> {
         let entries: Vec<String> = ftp_stream!(self, s => {
             s.list(Some(path)).await.map_err(|e| {
-                anyhow::anyhow!("Failed to list directory '{}': {}", path, e)
+                TransferError::operation(format!("Failed to list directory '{}': {}", path, e))
             })?
         });
 
@@ -218,112 +246,121 @@ impl FtpClient {
 
     /// Download a remote file to a local path. Streams in 32 KiB chunks —
     /// never buffers the entire file in memory. Returns bytes downloaded.
-    pub async fn download_file(&mut self, remote_path: &str, local_path: &str) -> Result<u64> {
+    pub async fn download_file(
+        &mut self,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Result<u64, TransferError> {
         let remote = remote_path.to_string();
         let local = local_path.to_string();
 
         Ok(ftp_stream!(self, s => {
-            let mut data_stream =
-                s.retr_as_stream(&remote)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to download file '{}': {}", remote, e))?;
-            let mut local_file = std::fs::File::create(&local)
-                .map_err(|e| anyhow::anyhow!("Failed to create local file '{}': {}", local, e))?;
+            let mut data_stream = s.retr_as_stream(&remote).await.map_err(|e| {
+                TransferError::operation(format!("Failed to download file '{}': {}", remote, e))
+            })?;
+            let mut local_file = std::fs::File::create(&local).map_err(|e| {
+                TransferError::operation(format!("Failed to create local file '{}': {}", local, e))
+            })?;
             let mut buf = vec![0u8; crate::file_entry::FILE_TRANSFER_CHUNK_SIZE];
             let mut total = 0u64;
             loop {
-                let n = data_stream
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to read download stream: {}", e))?;
+                let n = data_stream.read(&mut buf).await.map_err(|e| {
+                    TransferError::operation(format!("Failed to read download stream: {}", e))
+                })?;
                 if n == 0 {
                     break;
                 }
-                local_file
-                    .write_all(&buf[..n])
-                    .map_err(|e| anyhow::anyhow!("Failed to write local file: {}", e))?;
+                local_file.write_all(&buf[..n]).map_err(|e| {
+                    TransferError::operation(format!("Failed to write local file: {}", e))
+                })?;
                 total += n as u64;
             }
-            local_file
-                .flush()
-                .map_err(|e| anyhow::anyhow!("Failed to flush local file: {}", e))?;
-            s.finalize_retr_stream(data_stream)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to finalize download: {}", e))?;
+            local_file.flush().map_err(|e| {
+                TransferError::operation(format!("Failed to flush local file: {}", e))
+            })?;
+            s.finalize_retr_stream(data_stream).await.map_err(|e| {
+                TransferError::operation(format!("Failed to finalize download: {}", e))
+            })?;
             total
         }))
     }
 
     /// Upload a local file to a remote path. Streams in 32 KiB chunks —
     /// never buffers the entire file in memory. Returns bytes uploaded.
-    pub async fn upload_file(&mut self, local_path: &str, remote_path: &str) -> Result<u64> {
+    pub async fn upload_file(
+        &mut self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<u64, TransferError> {
         let local = local_path.to_string();
         let remote = remote_path.to_string();
 
         Ok(ftp_stream!(self, s => {
-            let mut data_stream =
-                s.put_with_stream(&remote)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to open upload stream: {}", e))?;
-            let mut local_file = std::fs::File::open(&local)
-                .map_err(|e| anyhow::anyhow!("Failed to open local file '{}': {}", local, e))?;
+            let mut data_stream = s.put_with_stream(&remote).await.map_err(|e| {
+                TransferError::operation(format!("Failed to open upload stream: {}", e))
+            })?;
+            let mut local_file = std::fs::File::open(&local).map_err(|e| {
+                TransferError::operation(format!("Failed to open local file '{}': {}", local, e))
+            })?;
             let mut buf = vec![0u8; crate::file_entry::FILE_TRANSFER_CHUNK_SIZE];
             let mut total = 0u64;
             loop {
-                let n = local_file
-                    .read(&mut buf)
-                    .map_err(|e| anyhow::anyhow!("Failed to read local file: {}", e))?;
+                let n = local_file.read(&mut buf).map_err(|e| {
+                    TransferError::operation(format!("Failed to read local file: {}", e))
+                })?;
                 if n == 0 {
                     break;
                 }
-                data_stream
-                    .write_all(&buf[..n])
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to write upload stream: {}", e))?;
+                data_stream.write_all(&buf[..n]).await.map_err(|e| {
+                    TransferError::operation(format!("Failed to write upload stream: {}", e))
+                })?;
                 total += n as u64;
             }
-            s.finalize_put_stream(data_stream)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to finalize upload: {}", e))?;
+            s.finalize_put_stream(data_stream).await.map_err(|e| {
+                TransferError::operation(format!("Failed to finalize upload: {}", e))
+            })?;
             total
         }))
     }
 
     /// Create a directory on the remote server.
-    pub async fn create_dir(&mut self, path: &str) -> Result<()> {
+    pub async fn create_dir(&mut self, path: &str) -> Result<(), TransferError> {
         ftp_stream!(self, s => {
             s.mkdir(path).await.map_err(|e| {
-                anyhow::anyhow!("Failed to create directory '{}': {}", path, e)
+                TransferError::operation(format!("Failed to create directory '{}': {}", path, e))
             })?
         });
         Ok(())
     }
 
     /// Rename a file or directory.
-    pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<()> {
+    pub async fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), TransferError> {
         ftp_stream!(self, s => {
             s.rename(old_path, new_path).await.map_err(|e| {
-                anyhow::anyhow!("Failed to rename '{}' to '{}': {}", old_path, new_path, e)
+                TransferError::operation(format!(
+                    "Failed to rename '{}' to '{}': {}",
+                    old_path, new_path, e
+                ))
             })?
         });
         Ok(())
     }
 
     /// Delete a file on the remote server.
-    pub async fn delete_file(&mut self, path: &str) -> Result<()> {
+    pub async fn delete_file(&mut self, path: &str) -> Result<(), TransferError> {
         ftp_stream!(self, s => {
             s.rm(path).await.map_err(|e| {
-                anyhow::anyhow!("Failed to delete file '{}': {}", path, e)
+                TransferError::operation(format!("Failed to delete file '{}': {}", path, e))
             })?
         });
         Ok(())
     }
 
     /// Delete a directory on the remote server.
-    pub async fn delete_dir(&mut self, path: &str) -> Result<()> {
+    pub async fn delete_dir(&mut self, path: &str) -> Result<(), TransferError> {
         ftp_stream!(self, s => {
             s.rmdir(path).await.map_err(|e| {
-                anyhow::anyhow!("Failed to delete directory '{}': {}", path, e)
+                TransferError::operation(format!("Failed to delete directory '{}': {}", path, e))
             })?
         });
         Ok(())

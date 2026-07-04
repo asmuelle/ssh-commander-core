@@ -6,7 +6,6 @@
 //! including error-message shape, chunked streaming, and sort order — stays
 //! identical across the two entry points.
 
-use anyhow::Result;
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -15,14 +14,17 @@ use crate::file_entry::{
     FileEntryType, RemoteFileEntry, format_permissions, format_unix_timestamp,
 };
 use crate::ssh::SFTP_CHUNK_SIZE;
+use crate::transfer::TransferError;
 
 /// List directory contents at `path`, skipping `.`/`..`, directories first,
 /// then case-insensitive by name.
-pub(crate) async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteFileEntry>> {
-    let entries = sftp
-        .read_dir(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to list directory '{}': {}", path, e))?;
+pub(crate) async fn list_dir(
+    sftp: &SftpSession,
+    path: &str,
+) -> Result<Vec<RemoteFileEntry>, TransferError> {
+    let entries = sftp.read_dir(path).await.map_err(|e| {
+        TransferError::operation(format!("Failed to list directory '{}': {}", path, e))
+    })?;
 
     let mut result = Vec::new();
     for entry in entries {
@@ -86,14 +88,19 @@ pub(crate) async fn download_file(
     local_path: &str,
     mut progress: impl FnMut(u64),
     cancel: Option<&CancellationToken>,
-) -> Result<u64> {
-    let mut remote_file = sftp
-        .open(remote_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to open remote file '{}': {}", remote_path, e))?;
-    let mut local_file = tokio::fs::File::create(local_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create local file '{}': {}", local_path, e))?;
+) -> Result<u64, TransferError> {
+    let mut remote_file = sftp.open(remote_path).await.map_err(|e| {
+        TransferError::operation(format!(
+            "Failed to open remote file '{}': {}",
+            remote_path, e
+        ))
+    })?;
+    let mut local_file = tokio::fs::File::create(local_path).await.map_err(|e| {
+        TransferError::operation(format!(
+            "Failed to create local file '{}': {}",
+            local_path, e
+        ))
+    })?;
 
     let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
     let mut total_bytes = 0u64;
@@ -101,7 +108,7 @@ pub(crate) async fn download_file(
         if let Some(token) = cancel
             && token.is_cancelled()
         {
-            return Err(anyhow::anyhow!("Transfer cancelled"));
+            return Err(TransferError::Cancelled);
         }
         let n = remote_file.read(&mut buf).await?;
         if n == 0 {
@@ -118,11 +125,16 @@ pub(crate) async fn download_file(
 
 /// Read a remote file fully into memory. Only for small files — no
 /// progress or cancellation, the whole payload is buffered.
-pub(crate) async fn download_to_memory(sftp: &SftpSession, remote_path: &str) -> Result<Vec<u8>> {
-    let mut remote_file = sftp
-        .open(remote_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to open remote file '{}': {}", remote_path, e))?;
+pub(crate) async fn download_to_memory(
+    sftp: &SftpSession,
+    remote_path: &str,
+) -> Result<Vec<u8>, TransferError> {
+    let mut remote_file = sftp.open(remote_path).await.map_err(|e| {
+        TransferError::operation(format!(
+            "Failed to open remote file '{}': {}",
+            remote_path, e
+        ))
+    })?;
 
     let mut buffer = Vec::new();
     let mut temp_buf = vec![0u8; SFTP_CHUNK_SIZE];
@@ -145,14 +157,16 @@ pub(crate) async fn upload_file(
     remote_path: &str,
     mut progress: impl FnMut(u64),
     cancel: Option<&CancellationToken>,
-) -> Result<u64> {
-    let mut local_file = tokio::fs::File::open(local_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to open local file '{}': {}", local_path, e))?;
-    let mut remote_file = sftp
-        .create(remote_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create remote file '{}': {}", remote_path, e))?;
+) -> Result<u64, TransferError> {
+    let mut local_file = tokio::fs::File::open(local_path).await.map_err(|e| {
+        TransferError::operation(format!("Failed to open local file '{}': {}", local_path, e))
+    })?;
+    let mut remote_file = sftp.create(remote_path).await.map_err(|e| {
+        TransferError::operation(format!(
+            "Failed to create remote file '{}': {}",
+            remote_path, e
+        ))
+    })?;
 
     let mut buf = vec![0u8; SFTP_CHUNK_SIZE];
     let mut total_bytes = 0u64;
@@ -160,7 +174,7 @@ pub(crate) async fn upload_file(
         if let Some(token) = cancel
             && token.is_cancelled()
         {
-            return Err(anyhow::anyhow!("Transfer cancelled"));
+            return Err(TransferError::Cancelled);
         }
         let n = local_file.read(&mut buf).await?;
         if n == 0 {
@@ -180,11 +194,13 @@ pub(crate) async fn upload_from_bytes(
     sftp: &SftpSession,
     data: &[u8],
     remote_path: &str,
-) -> Result<u64> {
-    let mut remote_file = sftp
-        .create(remote_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create remote file '{}': {}", remote_path, e))?;
+) -> Result<u64, TransferError> {
+    let mut remote_file = sftp.create(remote_path).await.map_err(|e| {
+        TransferError::operation(format!(
+            "Failed to create remote file '{}': {}",
+            remote_path, e
+        ))
+    })?;
 
     for chunk in data.chunks(SFTP_CHUNK_SIZE) {
         remote_file.write_all(chunk).await?;
@@ -196,37 +212,44 @@ pub(crate) async fn upload_from_bytes(
 
 /// Create a directory on the remote. Fails if the parent doesn't exist or
 /// the path is already taken.
-pub(crate) async fn create_dir(sftp: &SftpSession, path: &str) -> Result<()> {
-    sftp.create_dir(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create directory '{}': {}", path, e))?;
+pub(crate) async fn create_dir(sftp: &SftpSession, path: &str) -> Result<(), TransferError> {
+    sftp.create_dir(path).await.map_err(|e| {
+        TransferError::operation(format!("Failed to create directory '{}': {}", path, e))
+    })?;
     Ok(())
 }
 
 /// Rename a file or directory. SFTP RENAME is atomic when source and
 /// destination are on the same filesystem; cross-filesystem renames may
 /// copy-then-delete depending on the server.
-pub(crate) async fn rename(sftp: &SftpSession, old_path: &str, new_path: &str) -> Result<()> {
-    sftp.rename(old_path, new_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to rename '{}' to '{}': {}", old_path, new_path, e))?;
+pub(crate) async fn rename(
+    sftp: &SftpSession,
+    old_path: &str,
+    new_path: &str,
+) -> Result<(), TransferError> {
+    sftp.rename(old_path, new_path).await.map_err(|e| {
+        TransferError::operation(format!(
+            "Failed to rename '{}' to '{}': {}",
+            old_path, new_path, e
+        ))
+    })?;
     Ok(())
 }
 
 /// Delete a regular file. For directories, use [`delete_dir`].
-pub(crate) async fn delete_file(sftp: &SftpSession, path: &str) -> Result<()> {
-    sftp.remove_file(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to delete file '{}': {}", path, e))?;
+pub(crate) async fn delete_file(sftp: &SftpSession, path: &str) -> Result<(), TransferError> {
+    sftp.remove_file(path).await.map_err(|e| {
+        TransferError::operation(format!("Failed to delete file '{}': {}", path, e))
+    })?;
     Ok(())
 }
 
 /// Delete an empty directory. SFTP requires the directory be empty;
 /// recursive removal belongs at the caller layer (with progress reporting).
-pub(crate) async fn delete_dir(sftp: &SftpSession, path: &str) -> Result<()> {
-    sftp.remove_dir(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to delete directory '{}': {}", path, e))?;
+pub(crate) async fn delete_dir(sftp: &SftpSession, path: &str) -> Result<(), TransferError> {
+    sftp.remove_dir(path).await.map_err(|e| {
+        TransferError::operation(format!("Failed to delete directory '{}': {}", path, e))
+    })?;
     Ok(())
 }
 

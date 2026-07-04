@@ -1,5 +1,5 @@
 use crate::file_entry::RemoteFileEntry;
-use anyhow::Result;
+use crate::transfer::TransferError;
 use russh::keys::{HashAlg, PublicKeyBase64};
 use russh::*;
 use russh_sftp::client::SftpSession;
@@ -11,11 +11,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub mod error;
 pub mod host_keys;
 pub(crate) mod pty_registry;
 pub(crate) mod sftp_ops;
 pub mod shell;
 pub mod tunnel;
+pub use error::SshError;
 pub use host_keys::{
     HostKeyMismatch, HostKeyStore, HostKeyStoreAccessError, HostKeyVerificationFailure, Verdict,
     VerificationFailureSlot,
@@ -361,7 +363,7 @@ pub(crate) async fn connect_authenticated(
     auth: ResolvedAuth<'_>,
     timeout: Duration,
     host_keys: Arc<HostKeyStore>,
-) -> Result<client::Handle<Client>> {
+) -> Result<client::Handle<Client>, SshError> {
     let ssh_config = client::Config {
         preferred: russh::Preferred {
             // Cow::Borrowed is required in russh 0.61 — the fields changed from
@@ -382,17 +384,14 @@ pub(crate) async fn connect_authenticated(
         client::connect(Arc::new(ssh_config), (host, port), handler),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Connection timed out after {}s. Please check the host address and network.",
-            timeout.as_secs()
-        )
+    .map_err(|_| SshError::ConnectTimeout {
+        seconds: timeout.as_secs(),
     })?
     .map_err(|e| {
         if let Ok(mut guard) = verification_failure_slot.lock()
             && let Some(failure) = guard.take()
         {
-            return anyhow::anyhow!(format_verification_failure(&failure));
+            return SshError::HostKeyVerification(failure);
         }
 
         // "Connection reset by peer" during the initial handshake almost
@@ -405,8 +404,8 @@ pub(crate) async fn connect_authenticated(
         let looks_like_reset = msg.contains("reset by peer")
             || msg.contains("ConnectionReset")
             || msg.contains("kex_exchange_identification");
-        if looks_like_reset {
-            return anyhow::anyhow!(
+        let message = if looks_like_reset {
+            format!(
                 "The SSH server at {}:{} accepted the TCP connection but then \
                  reset it during the handshake ({}).\n\n\
                  This usually means the server is rejecting your source IP \
@@ -417,13 +416,16 @@ pub(crate) async fn connect_authenticated(
                    network.\n\
                  - Verify the host and port are correct for external access \
                    (some services publish a different SFTP endpoint).",
-                host,
-                port,
-                e
-            );
+                host, port, e
+            )
+        } else {
+            format!("Failed to connect to {}:{}: {}", host, port, e)
+        };
+        SshError::Connect {
+            host: host.to_string(),
+            port,
+            message,
         }
-
-        anyhow::anyhow!("Failed to connect to {}:{}: {}", host, port, e)
     })?;
 
     // Capture what we need for the `!authenticated` error before moving `auth`
@@ -445,7 +447,9 @@ pub(crate) async fn connect_authenticated(
         ResolvedAuth::Password { password } => session
             .authenticate_password(username, password)
             .await
-            .map_err(|e| anyhow::anyhow!("Password authentication failed: {}", e))?
+            .map_err(|e| SshError::Auth {
+                message: format!("Password authentication failed: {}", e),
+            })?
             .success(),
         ResolvedAuth::Key { key, .. } => {
             // russh 0.61: authenticate_publickey takes PrivateKeyWithHashAlg
@@ -469,11 +473,11 @@ pub(crate) async fn connect_authenticated(
                 let auth = session
                     .authenticate_publickey(username, key_with_alg)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
+                    .map_err(|e| SshError::Auth {
+                        message: format!(
                             "Public key authentication failed: {}. The key may not be authorized on the server.",
                             e
-                        )
+                        ),
                     })?;
                 if auth.success() {
                     authenticated = true;
@@ -488,50 +492,54 @@ pub(crate) async fn connect_authenticated(
             // implements the Signer trait in russh 0.61 (russh::auth::Signer).
             let mut agent = russh::keys::agent::client::AgentClient::connect_env()
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
+                .map_err(|e| SshError::Auth {
+                    message: format!(
                         "SSH agent authentication is enabled, but r-shell could not connect to SSH_AUTH_SOCK: {}",
                         e
-                    )
+                    ),
                 })?;
             let identities = agent
                 .request_identities()
                 .await
-                .map_err(|e| anyhow::anyhow!("SSH agent did not return identities: {}", e))?;
+                .map_err(|e| SshError::Auth {
+                    message: format!("SSH agent did not return identities: {}", e),
+                })?;
             let identity = select_agent_identity(identities, identity_hint).ok_or_else(|| {
-                if let Some(hint) = identity_hint.filter(|hint| !hint.is_empty()) {
-                    anyhow::anyhow!(
+                let message = if let Some(hint) = identity_hint.filter(|hint| !hint.is_empty()) {
+                    format!(
                         "SSH agent has no identity matching '{}'. Add the key to your agent or clear the identity hint.",
                         hint
                     )
                 } else {
-                    anyhow::anyhow!("SSH agent has no identities. Add a key to your agent and try again.")
-                }
+                    "SSH agent has no identities. Add a key to your agent and try again."
+                        .to_string()
+                };
+                SshError::Auth { message }
             })?;
             // Extract the public key from the agent identity for authenticate_publickey_with.
             let public_key = identity.public_key().into_owned();
             session
                 .authenticate_publickey_with(username, public_key, None, &mut agent)
                 .await
-                .map_err(|e| anyhow::anyhow!("SSH agent authentication failed: {}", e))?
+                .map_err(|e| SshError::Auth {
+                    message: format!("SSH agent authentication failed: {}", e),
+                })?
                 .success()
         }
     };
 
     if !authenticated {
-        return Err(match key_hint_for_error {
-            None => anyhow::anyhow!(
+        let message = match key_hint_for_error {
+            None => format!(
                 "Authentication failed for {}@{} with password authentication.",
-                username,
-                host
+                username, host
             ),
-            Some(path) => anyhow::anyhow!(
+            Some(path) => format!(
                 "Authentication failed for {}@{} using public key {}.",
-                username,
-                host,
-                path
+                username, host, path
             ),
-        });
+        };
+        return Err(SshError::Auth { message });
     }
 
     Ok(session)
@@ -614,12 +622,12 @@ pub(crate) fn expand_home_path(path: &str) -> Option<String> {
 pub(crate) fn load_private_key(
     key_path: &str,
     passphrase: Option<&str>,
-) -> Result<russh::keys::PrivateKey> {
-    let expanded = expand_home_path(key_path).ok_or_else(|| {
-        anyhow::anyhow!(
+) -> Result<russh::keys::PrivateKey, SshError> {
+    let expanded = expand_home_path(key_path).ok_or_else(|| SshError::KeyLoad {
+        message: format!(
             "Cannot resolve '~' in SSH key path '{}': home directory unknown.",
             key_path
-        )
+        ),
     })?;
     let path = Path::new(&expanded);
 
@@ -637,43 +645,46 @@ pub(crate) fn load_private_key(
     match path.metadata() {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(anyhow::anyhow!(
-                "SSH key file not found: {}. Please check the file path and try again.",
-                location
-            ));
+            return Err(SshError::KeyLoad {
+                message: format!(
+                    "SSH key file not found: {}. Please check the file path and try again.",
+                    location
+                ),
+            });
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(anyhow::anyhow!(
-                "Permission denied reading SSH key at {}.\n\
-                 On macOS this usually means r-shell hasn't been granted access to this file. \
-                 Open System Settings → Privacy & Security → Full Disk Access (or App Management / Files and Folders), \
-                 add r-shell to the list, then try again.",
-                location
-            ));
+            return Err(SshError::KeyLoad {
+                message: format!(
+                    "Permission denied reading SSH key at {}.\n\
+                     On macOS this usually means r-shell hasn't been granted access to this file. \
+                     Open System Settings → Privacy & Security → Full Disk Access (or App Management / Files and Folders), \
+                     add r-shell to the list, then try again.",
+                    location
+                ),
+            });
         }
         Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Cannot access SSH key at {}: {}",
-                location,
-                e
-            ));
+            return Err(SshError::KeyLoad {
+                message: format!("Cannot access SSH key at {}: {}", location, e),
+            });
         }
     }
 
     // load_secret_key lives in russh::keys in russh 0.61 (was from russh_keys:: wildcard).
     russh::keys::load_secret_key(path, passphrase).map_err(|e| {
         let msg = e.to_string();
-        if msg.contains("encrypted") || msg.contains("passphrase") {
-            anyhow::anyhow!(
+        let message = if msg.contains("encrypted") || msg.contains("passphrase") {
+            format!(
                 "Failed to decrypt SSH key at {}. The key may be encrypted. Please provide the correct passphrase.",
                 expanded
             )
         } else {
-            anyhow::anyhow!(
+            format!(
                 "Failed to load SSH key from {}: {}. Ensure the file is a valid SSH private key (RSA, Ed25519, or ECDSA).",
                 expanded, e
             )
-        }
+        };
+        SshError::KeyLoad { message }
     })
 }
 
@@ -689,25 +700,37 @@ impl SshClient {
     /// Return a handle to a cached SFTP session, opening the subsystem on
     /// first call. Subsequent calls reuse the same session, saving the
     /// channel-open + subsystem-negotiation round-trip.
-    async fn sftp_session(&self) -> Result<Arc<SftpSession>> {
+    async fn sftp_session(&self) -> Result<Arc<SftpSession>, TransferError> {
         let session = self
             .session
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Not connected"))?
+            .ok_or(TransferError::NotConnected("SSH"))?
             .clone();
-        let sftp = self
-            .sftp
-            .get_or_try_init(|| async move {
-                let channel = session.channel_open_session().await?;
-                channel.request_subsystem(true, "sftp").await?;
-                let session = SftpSession::new(channel.into_stream()).await?;
-                Ok::<_, anyhow::Error>(Arc::new(session))
-            })
-            .await?;
+        let sftp =
+            self.sftp
+                .get_or_try_init(|| async move {
+                    let channel = session.channel_open_session().await.map_err(|e| {
+                        TransferError::Session {
+                            message: format!("Failed to open SFTP channel: {}", e),
+                        }
+                    })?;
+                    channel.request_subsystem(true, "sftp").await.map_err(|e| {
+                        TransferError::Session {
+                            message: format!("Failed to start SFTP subsystem: {}", e),
+                        }
+                    })?;
+                    let session = SftpSession::new(channel.into_stream()).await.map_err(|e| {
+                        TransferError::Session {
+                            message: format!("Failed to initialise SFTP session: {}", e),
+                        }
+                    })?;
+                    Ok::<_, TransferError>(Arc::new(session))
+                })
+                .await?;
         Ok(sftp.clone())
     }
 
-    pub async fn connect(&mut self, config: &SshConfig) -> Result<()> {
+    pub async fn connect(&mut self, config: &SshConfig) -> Result<(), SshError> {
         let auth = match &config.auth_method {
             AuthMethod::Password { password } => ResolvedAuth::Password { password },
             AuthMethod::PublicKey {
@@ -744,19 +767,25 @@ impl SshClient {
     ///
     /// For callers that need to branch on the exit code or separate streams,
     /// use [`SshClient::execute_command_full`] instead.
-    pub async fn execute_command(&self, command: &str) -> Result<String> {
+    pub async fn execute_command(&self, command: &str) -> Result<String, SshError> {
         let out = self.execute_command_full(command).await?;
         Ok(out.combined())
     }
 
     /// Execute a remote command and return full stdout/stderr/exit-code.
-    pub async fn execute_command_full(&self, command: &str) -> Result<CommandOutput> {
+    pub async fn execute_command_full(&self, command: &str) -> Result<CommandOutput, SshError> {
         let Some(session) = &self.session else {
-            return Err(anyhow::anyhow!("Not connected"));
+            return Err(SshError::NotConnected);
         };
 
-        let mut channel = session.channel_open_session().await?;
-        channel.exec(true, command).await?;
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .map_err(SshError::transport)?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(SshError::transport)?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -815,13 +844,19 @@ impl SshClient {
     pub async fn execute_command_streaming(
         &self,
         command: &str,
-    ) -> Result<(mpsc::Receiver<String>, CancellationToken)> {
+    ) -> Result<(mpsc::Receiver<String>, CancellationToken), SshError> {
         let Some(session) = &self.session else {
-            return Err(anyhow::anyhow!("Not connected"));
+            return Err(SshError::NotConnected);
         };
 
-        let mut channel = session.channel_open_session().await?;
-        channel.exec(true, command).await?;
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .map_err(SshError::transport)?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(SshError::transport)?;
 
         let (tx, rx) = mpsc::channel::<String>(256);
         let cancel = CancellationToken::new();
@@ -881,7 +916,7 @@ impl SshClient {
         Ok((rx, cancel))
     }
 
-    pub async fn disconnect(&mut self) -> Result<()> {
+    pub async fn disconnect(&mut self) -> Result<(), SshError> {
         // Drop the cached SFTP session first so its channel shuts cleanly
         // before we tear down the underlying SSH transport.
         self.sftp.take();
@@ -913,22 +948,30 @@ impl SshClient {
     /// `originator_address`/`originator_port` are reported to the server
     /// for logging/auditing and may be `127.0.0.1:0` when the caller
     /// doesn't have a meaningful client endpoint to advertise.
-    pub async fn open_direct_tcpip(&self, host: &str, port: u16) -> Result<TunnelChannel> {
+    pub async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<TunnelChannel, SshError> {
         let Some(session) = &self.session else {
-            return Err(anyhow::anyhow!("Not connected"));
+            return Err(SshError::NotConnected);
         };
         let channel = session
             .channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", 0)
-            .await?;
+            .await
+            .map_err(SshError::transport)?;
         Ok(TunnelChannel(channel))
     }
 
     /// Create a persistent PTY shell session (like ttyd)
     /// This enables interactive commands like vim, less, more, top, etc.
-    pub async fn create_pty_session(&self, cols: u32, rows: u32) -> Result<PtySession> {
+    pub async fn create_pty_session(&self, cols: u32, rows: u32) -> Result<PtySession, SshError> {
         if let Some(session) = &self.session {
             // Open a new SSH channel
-            let mut channel = session.channel_open_session().await?;
+            let mut channel = session
+                .channel_open_session()
+                .await
+                .map_err(SshError::transport)?;
 
             // Request PTY with terminal type and dimensions
             // Similar to ttyd's approach: xterm-256color terminal
@@ -942,10 +985,14 @@ impl SshClient {
                     0,                // pixel_height (not used)
                     &[],              // terminal modes
                 )
-                .await?;
+                .await
+                .map_err(SshError::transport)?;
 
             // Start interactive shell
-            channel.request_shell(true).await?;
+            channel
+                .request_shell(true)
+                .await
+                .map_err(SshError::transport)?;
 
             // Create channels for bidirectional communication (like ttyd's pty_buf)
             // Increased capacity for better buffering during fast input
@@ -1059,16 +1106,20 @@ impl SshClient {
                 cancel,
             })
         } else {
-            Err(anyhow::anyhow!("Not connected"))
+            Err(SshError::NotConnected)
         }
     }
 
-    pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>> {
+    pub async fn list_dir(&self, path: &str) -> Result<Vec<RemoteFileEntry>, TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::list_dir(&sftp, path).await
     }
 
-    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> Result<u64> {
+    pub async fn download_file(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Result<u64, TransferError> {
         self.download_file_with_progress(remote_path, local_path, |_| {}, None)
             .await
     }
@@ -1094,17 +1145,24 @@ impl SshClient {
         local_path: &str,
         progress: impl FnMut(u64),
         cancel: Option<&CancellationToken>,
-    ) -> Result<u64> {
+    ) -> Result<u64, TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::download_file(&sftp, remote_path, local_path, progress, cancel).await
     }
 
-    pub async fn download_file_to_memory(&self, remote_path: &str) -> Result<Vec<u8>> {
+    pub async fn download_file_to_memory(
+        &self,
+        remote_path: &str,
+    ) -> Result<Vec<u8>, TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::download_to_memory(&sftp, remote_path).await
     }
 
-    pub async fn upload_file(&self, local_path: &str, remote_path: &str) -> Result<u64> {
+    pub async fn upload_file(
+        &self,
+        local_path: &str,
+        remote_path: &str,
+    ) -> Result<u64, TransferError> {
         self.upload_file_with_progress(local_path, remote_path, |_| {}, None)
             .await
     }
@@ -1122,19 +1180,23 @@ impl SshClient {
         remote_path: &str,
         progress: impl FnMut(u64),
         cancel: Option<&CancellationToken>,
-    ) -> Result<u64> {
+    ) -> Result<u64, TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::upload_file(&sftp, local_path, remote_path, progress, cancel).await
     }
 
-    pub async fn upload_file_from_bytes(&self, data: &[u8], remote_path: &str) -> Result<u64> {
+    pub async fn upload_file_from_bytes(
+        &self,
+        data: &[u8],
+        remote_path: &str,
+    ) -> Result<u64, TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::upload_from_bytes(&sftp, data, remote_path).await
     }
 
     /// Create a directory on the remote. Fails if the parent doesn't
     /// exist or the path is already taken.
-    pub async fn create_dir(&self, path: &str) -> Result<()> {
+    pub async fn create_dir(&self, path: &str) -> Result<(), TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::create_dir(&sftp, path).await
     }
@@ -1142,13 +1204,13 @@ impl SshClient {
     /// Rename a file or directory. SFTP RENAME is atomic when source
     /// and destination are on the same filesystem; cross-filesystem
     /// renames may copy-then-delete depending on the server.
-    pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+    pub async fn rename(&self, old_path: &str, new_path: &str) -> Result<(), TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::rename(&sftp, old_path, new_path).await
     }
 
     /// Delete a regular file. For directories, use `delete_dir`.
-    pub async fn delete_file(&self, path: &str) -> Result<()> {
+    pub async fn delete_file(&self, path: &str) -> Result<(), TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::delete_file(&sftp, path).await
     }
@@ -1156,7 +1218,7 @@ impl SshClient {
     /// Delete an empty directory. SFTP requires the directory be empty;
     /// recursive removal would need a list-then-delete loop, which
     /// belongs at the caller layer (with progress reporting).
-    pub async fn delete_dir(&self, path: &str) -> Result<()> {
+    pub async fn delete_dir(&self, path: &str) -> Result<(), TransferError> {
         let sftp = self.sftp_session().await?;
         sftp_ops::delete_dir(&sftp, path).await
     }
