@@ -1,5 +1,6 @@
 #[cfg(feature = "desktop")]
 use crate::desktop_protocol::{DesktopConnectRequest, DesktopProtocol, FrameUpdate};
+use crate::event_bus::{self, ConnectionStatus, CoreEvent};
 #[cfg(feature = "ftp")]
 use crate::ftp_client::FtpClient;
 #[cfg(feature = "desktop")]
@@ -20,6 +21,7 @@ use ssh_commander_pg::{PgConfig, PgPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 #[cfg(feature = "desktop")]
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -190,6 +192,11 @@ pub struct ConnectionManager {
     /// Shared TOFU host-key store used by every SSH/SFTP connection.
     #[cfg(feature = "ssh")]
     host_keys: Arc<HostKeyStore>,
+    /// Sink for domain events (connection status, transfer progress, …).
+    /// Defaults to the process-wide bus in `event_bus`; inject a private
+    /// channel via `with_event_sender` for isolated instances (tests,
+    /// multi-manager embedders).
+    events: broadcast::Sender<CoreEvent>,
 }
 
 impl Default for ConnectionManager {
@@ -208,20 +215,64 @@ impl ConnectionManager {
     /// no host-key store or PTY state to initialise.
     #[cfg(not(feature = "ssh"))]
     pub fn new() -> Self {
+        Self::with_event_sender(event_bus::global_sender())
+    }
+
+    /// Construct a manager that publishes to `events` instead of the global
+    /// bus. Useful for tests and embedders running multiple isolated
+    /// manager instances.
+    #[cfg(not(feature = "ssh"))]
+    pub fn with_event_sender(events: broadcast::Sender<CoreEvent>) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             pending_connections: Arc::new(RwLock::new(HashMap::new())),
+            events,
         }
     }
 
     #[cfg(feature = "ssh")]
     pub fn with_host_keys(host_keys: Arc<HostKeyStore>) -> Self {
+        Self::with_host_keys_and_event_sender(host_keys, event_bus::global_sender())
+    }
+
+    /// Construct a manager that publishes to `events` instead of the global
+    /// bus. Useful for tests and embedders running multiple isolated
+    /// manager instances.
+    #[cfg(feature = "ssh")]
+    pub fn with_event_sender(events: broadcast::Sender<CoreEvent>) -> Self {
+        Self::with_host_keys_and_event_sender(
+            Arc::new(HostKeyStore::new(HostKeyStore::default_path())),
+            events,
+        )
+    }
+
+    #[cfg(feature = "ssh")]
+    pub fn with_host_keys_and_event_sender(
+        host_keys: Arc<HostKeyStore>,
+        events: broadcast::Sender<CoreEvent>,
+    ) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             ptys: PtyRegistry::new(),
             pending_connections: Arc::new(RwLock::new(HashMap::new())),
             host_keys,
+            events,
         }
+    }
+
+    /// The sink this manager publishes domain events to. Callers that emit
+    /// their own events (e.g. transfer progress from an FFI bridge) should
+    /// send into this rather than reaching for the global bus, so every
+    /// event for this manager's connections flows through one channel.
+    pub fn event_sender(&self) -> broadcast::Sender<CoreEvent> {
+        self.events.clone()
+    }
+
+    /// Publish an event, ignoring the send error when no subscriber is
+    /// currently attached — events are latency-sensitive notifications, not
+    /// reliability-sensitive state.
+    fn publish(&self, event: CoreEvent) {
+        let _ = self.events.send(event);
     }
 
     /// Access the shared host-key store. Used by the macOS bridge to
@@ -385,9 +436,10 @@ impl ConnectionManager {
                 // cancelling the SSH local-forward accept loop.
             }
         }
-        // `connection_id` is unused when no protocol arm consumes it (e.g.
-        // a postgres-only build), so keep it referenced to avoid a warning.
-        let _ = connection_id;
+        self.publish(CoreEvent::ConnectionStatus {
+            connection_id: connection_id.to_string(),
+            status: ConnectionStatus::Disconnected,
+        });
         Ok(())
     }
 
@@ -413,8 +465,14 @@ impl ConnectionManager {
                 .await?;
         }
 
-        let mut connections = self.connections.write().await;
-        connections.insert(connection_id, replacement);
+        {
+            let mut connections = self.connections.write().await;
+            connections.insert(connection_id.clone(), replacement);
+        }
+        self.publish(CoreEvent::ConnectionStatus {
+            connection_id,
+            status: ConnectionStatus::Connected,
+        });
         Ok(())
     }
 
@@ -941,6 +999,50 @@ mod tests {
         let mgr = ConnectionManager::new();
         let result = mgr.close_ftp_connection("ghost").await;
         assert!(result.is_ok());
+    }
+
+    #[cfg(all(feature = "ssh", feature = "desktop"))]
+    #[tokio::test]
+    async fn test_manager_publishes_status_events_on_injected_sink() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mgr = ConnectionManager::with_event_sender(tx);
+
+        mgr.replace_managed_connection(
+            "desk".to_string(),
+            ManagedConnection::Desktop {
+                kind: ProtocolKind::Rdp,
+                client: Arc::new(RwLock::new(Box::new(TestDesktopClient))),
+            },
+        )
+        .await
+        .expect("register test connection");
+
+        match rx.try_recv().expect("Connected event") {
+            CoreEvent::ConnectionStatus {
+                connection_id,
+                status,
+            } => {
+                assert_eq!(connection_id, "desk");
+                assert_eq!(status, ConnectionStatus::Connected);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        mgr.close_desktop_connection("desk").await.expect("close");
+        match rx.try_recv().expect("Disconnected event") {
+            CoreEvent::ConnectionStatus {
+                connection_id,
+                status,
+            } => {
+                assert_eq!(connection_id, "desk");
+                assert_eq!(status, ConnectionStatus::Disconnected);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // The injected sink is private — nothing leaked to the global bus.
+        let mut global_rx = event_bus::subscribe();
+        assert!(global_rx.try_recv().is_err());
     }
 
     #[cfg(all(feature = "ssh", feature = "desktop"))]

@@ -78,24 +78,32 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 static EVENT_TX: OnceLock<broadcast::Sender<CoreEvent>> = OnceLock::new();
 
-/// Get a sender handle to the event bus. The channel is lazily created on
-/// first call with a capacity of 1024 events.
-pub fn event_sender() -> Option<broadcast::Sender<CoreEvent>> {
-    let tx = EVENT_TX.get_or_init(|| {
-        let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        tx
-    });
-    Some(tx.clone())
+/// The process-wide event channel, lazily created on first use with a
+/// capacity of 1024 events. This is the default sink a `ConnectionManager`
+/// publishes to; tests (or embedders that want isolated instances) can
+/// construct a manager with `ConnectionManager::with_event_sender` instead.
+pub fn global_sender() -> broadcast::Sender<CoreEvent> {
+    EVENT_TX
+        .get_or_init(|| {
+            let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+            tx
+        })
+        .clone()
 }
 
-/// Subscribe to all events. Returns a receiver that starts with a `RecvError::Lagged`
-/// for any events produced before this subscription.
+/// Get a sender handle to the global event bus.
+///
+/// Always returns `Some`; the `Option` is kept for backward compatibility
+/// with existing FFI callers. Prefer [`global_sender`] in new code.
+pub fn event_sender() -> Option<broadcast::Sender<CoreEvent>> {
+    Some(global_sender())
+}
+
+/// Subscribe to all events on the global bus. Returns a receiver that starts
+/// with a `RecvError::Lagged` for any events produced before this
+/// subscription.
 pub fn subscribe() -> broadcast::Receiver<CoreEvent> {
-    let tx = EVENT_TX.get_or_init(|| {
-        let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        tx
-    });
-    tx.subscribe()
+    global_sender().subscribe()
 }
 
 // ---------------------------------------------------------------------------
