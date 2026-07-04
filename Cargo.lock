@@ -3222,7 +3222,6 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
- "ssh-commander-keychain",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",

@@ -92,6 +92,11 @@ pub enum PgError {
     Connect(String),
     #[error("postgres auth failed: {0}")]
     Auth(String),
+    /// The config still carries a credential-store reference (e.g.
+    /// `PgAuthMethod::Keychain`) that the caller was supposed to resolve
+    /// into a concrete password before connecting.
+    #[error("unresolved credential: {0}")]
+    UnresolvedCredential(String),
     #[error("postgres tls setup failed: {0}")]
     Tls(String),
     #[error("ssh tunnel error: {0}")]
@@ -913,14 +918,15 @@ fn build_driver_config(cfg: &PgConfig) -> Result<PgDriverConfig, PgError> {
 
     let password = match &cfg.auth {
         PgAuthMethod::Password { password } => password.clone(),
-        PgAuthMethod::Keychain { account } => ssh_commander_keychain::load_password(
-            ssh_commander_keychain::CredentialKind::PostgresPassword,
-            account,
-        )
-        .map_err(|e| PgError::Auth(format!("keychain load failed for {account}: {e}")))?
-        .ok_or_else(|| {
-            PgError::Auth(format!("no keychain entry for postgres account {account}"))
-        })?,
+        // This crate is credential-store-agnostic: keychain (or any other
+        // secret-store) lookups happen in the caller — ssh-commander-core's
+        // ConnectionManager resolves Keychain into Password before connect.
+        PgAuthMethod::Keychain { account } => {
+            return Err(PgError::UnresolvedCredential(format!(
+                "keychain credential for account '{account}' must be resolved to a password \
+                 before PgPool::connect (ssh-commander-core's ConnectionManager does this)"
+            )));
+        }
     };
     if !password.is_empty() {
         driver.password(password);
@@ -1062,6 +1068,19 @@ mod tests {
         let cfg = PgConfig::local("db", "u");
         let driver = build_driver_config(&cfg).expect("driver cfg");
         assert!(driver.get_password().is_none());
+    }
+
+    #[test]
+    fn driver_config_rejects_unresolved_keychain_reference() {
+        let cfg = PgConfig {
+            auth: PgAuthMethod::Keychain {
+                account: "postgres:profile-1".to_string(),
+            },
+            ..PgConfig::local("db", "u")
+        };
+        let err = build_driver_config(&cfg).expect_err("keychain reference must be rejected");
+        assert!(matches!(err, PgError::UnresolvedCredential(_)));
+        assert!(err.to_string().contains("postgres:profile-1"));
     }
 
     /// Pure logic test of the eviction policy: given idle entries

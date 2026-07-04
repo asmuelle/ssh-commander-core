@@ -779,6 +779,7 @@ impl ConnectionManager {
         mut config: PgConfig,
         tunnel: Option<SshTunnelRef>,
     ) -> Result<()> {
+        config = resolve_pg_credentials(config).await?;
         // The tunnel seam lives here, not in the pool: if the profile
         // routes through SSH, this manager owns the already-open SSH
         // connection, so it stands up the `direct-tcpip` local forward
@@ -837,6 +838,7 @@ impl ConnectionManager {
         connection_id: String,
         config: PgConfig,
     ) -> Result<()> {
+        let config = resolve_pg_credentials(config).await?;
         let cancel_token = self.register_pending_connection(&connection_id).await;
         let connect_result = tokio::select! {
             res = PgPool::connect(config) => res.map_err(anyhow::Error::from),
@@ -881,6 +883,46 @@ impl ConnectionManager {
         let client = client.read().await;
         client.start_frame_loop(frame_tx, cancel).await
     }
+}
+
+/// Resolve a `PgAuthMethod::Keychain` reference into a concrete password
+/// before the config reaches `PgPool::connect` — the pg crate is
+/// credential-store-agnostic and rejects unresolved references.
+///
+/// Keychain access is synchronous (Security.framework), so the lookup runs
+/// on the blocking pool. Failures are wrapped as `PgError::Auth` with the
+/// same messages the pg crate produced when it did this lookup itself, so
+/// callers that downcast and classify errors see no change.
+#[cfg(feature = "postgres")]
+async fn resolve_pg_credentials(config: PgConfig) -> Result<PgConfig> {
+    use ssh_commander_pg::{PgAuthMethod, PgError};
+
+    let PgAuthMethod::Keychain { account } = config.auth.clone() else {
+        return Ok(config);
+    };
+
+    let loaded = tokio::task::spawn_blocking({
+        let account = account.clone();
+        move || {
+            ssh_commander_keychain::load_password(
+                ssh_commander_keychain::CredentialKind::PostgresPassword,
+                &account,
+            )
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("keychain lookup task failed: {e}"))?;
+
+    let password = loaded
+        .map_err(|e| PgError::Auth(format!("keychain load failed for {account}: {e}")))?
+        .ok_or_else(|| {
+            PgError::Auth(format!("no keychain entry for postgres account {account}"))
+        })?;
+
+    Ok(PgConfig {
+        auth: PgAuthMethod::Password { password },
+        ..config
+    })
 }
 
 // =============================================================================

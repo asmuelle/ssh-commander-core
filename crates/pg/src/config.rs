@@ -8,16 +8,19 @@ use serde::{Deserialize, Serialize};
 
 /// How to authenticate to the Postgres server.
 ///
-/// `Keychain` defers credential lookup to the macOS keychain at connect time;
-/// this matches the SSH/SFTP pattern and keeps secrets out of memory until
-/// they are actually required.
+/// `Keychain` is a *reference* to a credential-store entry, not a lookup this
+/// crate performs: the caller (e.g. ssh-commander-core's `ConnectionManager`)
+/// resolves it into a concrete `Password` before calling `PgPool::connect`.
+/// This keeps the crate credential-store-agnostic while still letting
+/// profiles avoid persisting plaintext passwords.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum PgAuthMethod {
-    /// Plaintext password supplied directly. Use only for ephemeral test
-    /// connections; production callers should prefer `Keychain`.
+    /// Concrete password. Profiles should prefer storing a `Keychain`
+    /// reference; this is what it resolves into at connect time.
     Password { password: String },
-    /// Resolve the password from the macOS keychain at connect time, using
-    /// the supplied `account` identifier (e.g. `"postgres:profile-id"`).
+    /// Reference to a credential-store entry, using the supplied `account`
+    /// identifier (e.g. `"postgres:profile-id"`). `PgPool::connect` rejects
+    /// an unresolved `Keychain` with `PgError::UnresolvedCredential`.
     Keychain { account: String },
 }
 
