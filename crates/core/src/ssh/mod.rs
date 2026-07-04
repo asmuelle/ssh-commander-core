@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub mod host_keys;
+pub(crate) mod pty_registry;
 pub(crate) mod sftp_ops;
 pub mod shell;
 pub mod tunnel;

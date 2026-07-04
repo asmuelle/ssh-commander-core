@@ -7,6 +7,8 @@ use crate::rdp_client::RdpClient;
 #[cfg(feature = "sftp")]
 use crate::sftp_client::StandaloneSftpClient;
 #[cfg(feature = "ssh")]
+use crate::ssh::pty_registry::PtyRegistry;
+#[cfg(feature = "ssh")]
 use crate::ssh::{HostKeyStore, PtySession, SshClient, SshConfig};
 #[cfg(all(feature = "postgres", feature = "ssh"))]
 use crate::ssh::{SshTunnel, SshTunnelRef};
@@ -183,11 +185,7 @@ pub struct ConnectionManager {
     /// PTY session state — only present when the SSH feature is enabled,
     /// since interactive shells are an SSH-only capability.
     #[cfg(feature = "ssh")]
-    pty_sessions: Arc<RwLock<HashMap<String, Arc<PtySession>>>>,
-    /// Generation counter per connection_id — incremented on each StartPty.
-    /// Used to prevent a stale Close from killing a newly created session.
-    #[cfg(feature = "ssh")]
-    pty_generations: Arc<RwLock<HashMap<String, u64>>>,
+    ptys: PtyRegistry,
     pending_connections: Arc<RwLock<HashMap<String, CancellationToken>>>,
     /// Shared TOFU host-key store used by every SSH/SFTP connection.
     #[cfg(feature = "ssh")]
@@ -220,8 +218,7 @@ impl ConnectionManager {
     pub fn with_host_keys(host_keys: Arc<HostKeyStore>) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
-            pty_sessions: Arc::new(RwLock::new(HashMap::new())),
-            pty_generations: Arc::new(RwLock::new(HashMap::new())),
+            ptys: PtyRegistry::new(),
             pending_connections: Arc::new(RwLock::new(HashMap::new())),
             host_keys,
         }
@@ -362,16 +359,7 @@ impl ConnectionManager {
         match connection {
             #[cfg(feature = "ssh")]
             ManagedConnection::Ssh(client) => {
-                {
-                    let mut pty_sessions = self.pty_sessions.write().await;
-                    if let Some(session) = pty_sessions.remove(connection_id) {
-                        session.cancel.cancel();
-                    }
-                }
-                {
-                    let mut generations = self.pty_generations.write().await;
-                    generations.remove(connection_id);
-                }
+                self.ptys.purge(connection_id).await;
                 let mut client = client.write().await;
                 client.disconnect().await?;
             }
@@ -505,30 +493,16 @@ impl ConnectionManager {
         // Cancel and remove any existing PTY session for this connection first.
         // This ensures the old SSH channel and reader task are torn down before
         // we create a new one, preventing orphaned sessions.
-        {
-            let mut pty_sessions = self.pty_sessions.write().await;
-            if let Some(old_session) = pty_sessions.remove(connection_id) {
-                old_session.cancel.cancel();
-                tracing::info!("Cancelled old PTY session for {}", connection_id);
-            }
-        }
+        self.ptys.cancel_existing(connection_id).await;
 
         let pty = {
             let client = client.read().await;
             client.create_pty_session(cols, rows).await?
         };
 
-        // Bump generation so any in-flight Close for the old session is ignored.
-        let mut generations = self.pty_generations.write().await;
-        let generation_entry = generations.entry(connection_id.to_string()).or_insert(0);
-        *generation_entry += 1;
-        let current_gen = *generation_entry;
-        drop(generations);
-
-        let mut pty_sessions = self.pty_sessions.write().await;
-        pty_sessions.insert(connection_id.to_string(), Arc::new(pty));
-
-        Ok(current_gen)
+        // Insert bumps the generation so any in-flight Close for the old
+        // session is ignored.
+        Ok(self.ptys.insert(connection_id, pty).await)
     }
 
     /// Send data to PTY (user input).
@@ -537,15 +511,14 @@ impl ConnectionManager {
     /// keystroke order.
     #[cfg(feature = "ssh")]
     pub async fn write_to_pty(&self, connection_id: &str, data: Vec<u8>) -> Result<()> {
-        let tx = {
-            let pty_sessions = self.pty_sessions.read().await;
-            let pty = pty_sessions
-                .get(connection_id)
-                .ok_or_else(|| anyhow::anyhow!("PTY connection not found"))?;
-            pty.input_tx.clone()
-        };
+        let pty = self
+            .ptys
+            .get(connection_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("PTY connection not found"))?;
 
-        tx.send(data)
+        pty.input_tx
+            .send(data)
             .await
             .map_err(|_| anyhow::anyhow!("PTY channel closed"))
     }
@@ -557,20 +530,18 @@ impl ConnectionManager {
     /// (which would replace the entry in `pty_sessions`).
     #[cfg(feature = "ssh")]
     pub async fn get_pty_session(&self, connection_id: &str) -> Option<Arc<PtySession>> {
-        self.pty_sessions.read().await.get(connection_id).cloned()
+        self.ptys.get(connection_id).await
     }
 
     /// Read a burst of PTY output — blocks until data arrives, then drains any
     /// additional already-queued chunks up to `max_bytes`.
     #[cfg(feature = "ssh")]
     pub async fn read_pty_burst(&self, connection_id: &str, max_bytes: usize) -> Result<Vec<u8>> {
-        let pty = {
-            let pty_sessions = self.pty_sessions.read().await;
-            pty_sessions
-                .get(connection_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("PTY connection not found"))?
-        };
+        let pty = self
+            .ptys
+            .get(connection_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("PTY connection not found"))?;
 
         let mut rx = pty.output_rx.lock().await;
 
@@ -597,39 +568,23 @@ impl ConnectionManager {
         connection_id: &str,
         expected_gen: Option<u64>,
     ) -> Result<()> {
-        if let Some(expected_generation) = expected_gen {
-            let generations = self.pty_generations.read().await;
-            let current_gen = generations.get(connection_id).copied().unwrap_or(0);
-            if current_gen != expected_generation {
-                tracing::info!(
-                    "Ignoring stale Close for {} (gen {} != current {})",
-                    connection_id,
-                    expected_generation,
-                    current_gen
-                );
-                return Ok(());
-            }
-        }
-        let mut pty_sessions = self.pty_sessions.write().await;
-        if let Some(session) = pty_sessions.remove(connection_id) {
-            session.cancel.cancel();
-        }
+        self.ptys.remove(connection_id, expected_gen).await;
         Ok(())
     }
 
     /// Get the cancellation token for a PTY session (used by WebSocket reader tasks).
     #[cfg(feature = "ssh")]
     pub async fn get_pty_cancel_token(&self, connection_id: &str) -> Option<CancellationToken> {
-        let sessions = self.pty_sessions.read().await;
-        sessions.get(connection_id).map(|s| s.cancel.clone())
+        self.ptys.cancel_token(connection_id).await
     }
 
     /// Resize PTY terminal (send window-change to remote SSH channel)
     #[cfg(feature = "ssh")]
     pub async fn resize_pty(&self, connection_id: &str, cols: u32, rows: u32) -> Result<()> {
-        let pty_sessions = self.pty_sessions.read().await;
-        let pty = pty_sessions
+        let pty = self
+            .ptys
             .get(connection_id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("PTY connection not found"))?;
 
         pty.resize_tx
