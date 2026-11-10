@@ -53,7 +53,9 @@ pub enum PgTlsMode {
     Prefer,
     /// Require TLS, but do not verify the server certificate.
     Require,
-    /// Require TLS and validate the server certificate against system roots.
+    /// Require TLS and validate the server certificate (chain and host
+    /// name) against the system roots plus any
+    /// [`PgConfig::tls_root_certs_pem`].
     VerifyFull,
 }
 
@@ -89,6 +91,21 @@ pub struct PgConfig {
     /// during inactivity at the cost of a reconnect on next use.
     #[serde(default)]
     pub min_idle_connections: Option<u32>,
+    /// Extra trust anchors for [`PgTlsMode::VerifyFull`]: one or more
+    /// PEM-encoded certificates, trusted **in addition to** the system
+    /// roots (libpq's `sslrootcert`, except that the system store stays
+    /// in play).
+    ///
+    /// Managed providers commonly sign server certificates with their own
+    /// private CA (Amazon RDS, Supabase), so without this the only way to
+    /// reach them is an unverified mode. Ignored by every other TLS mode —
+    /// those do not verify the certificate at all. Malformed PEM, or PEM
+    /// with no certificate in it, fails the connect with [`PgError::Tls`]
+    /// rather than silently falling back to the system roots.
+    ///
+    /// [`PgError::Tls`]: crate::PgError::Tls
+    #[serde(default)]
+    pub tls_root_certs_pem: Option<String>,
 }
 
 impl PgConfig {
@@ -109,6 +126,7 @@ impl PgConfig {
             max_pool_size: None,
             idle_timeout_secs: None,
             min_idle_connections: None,
+            tls_root_certs_pem: None,
         }
     }
 }
@@ -149,6 +167,7 @@ mod tests {
             max_pool_size: Some(10),
             idle_timeout_secs: Some(120),
             min_idle_connections: Some(0),
+            tls_root_certs_pem: Some("-----BEGIN CERTIFICATE-----\n".to_string()),
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: PgConfig = serde_json::from_str(&json).expect("deserialize");
@@ -157,6 +176,7 @@ mod tests {
         assert_eq!(back.max_pool_size, Some(10));
         assert_eq!(back.idle_timeout_secs, Some(120));
         assert_eq!(back.min_idle_connections, Some(0));
+        assert_eq!(back.tls_root_certs_pem, cfg.tls_root_certs_pem);
     }
 
     #[test]

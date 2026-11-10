@@ -905,7 +905,7 @@ fn build_tls_connector(cfg: &PgConfig) -> Result<TlsConnectorKind, PgError> {
         PgTlsMode::Disable => Ok(TlsConnectorKind::NoTls),
         PgTlsMode::Prefer | PgTlsMode::Require | PgTlsMode::VerifyFull => {
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let tls_config = build_rustls_config(cfg.tls)?;
+            let tls_config = build_rustls_config(cfg.tls, cfg.tls_root_certs_pem.as_deref())?;
             Ok(TlsConnectorKind::Rustls(MakeRustlsConnect::new(tls_config)))
         }
     }
@@ -947,23 +947,57 @@ fn build_driver_config(cfg: &PgConfig) -> Result<PgDriverConfig, PgError> {
     Ok(driver)
 }
 
-fn build_rustls_config(mode: PgTlsMode) -> Result<RustlsClientConfig, PgError> {
-    let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    for cert in native.certs {
-        let _ = roots.add(cert);
-    }
-
+fn build_rustls_config(
+    mode: PgTlsMode,
+    extra_roots_pem: Option<&str>,
+) -> Result<RustlsClientConfig, PgError> {
     let cfg = match mode {
-        PgTlsMode::VerifyFull => RustlsClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
+        PgTlsMode::VerifyFull => {
+            let mut roots = rustls::RootCertStore::empty();
+            let native = rustls_native_certs::load_native_certs();
+            for cert in native.certs {
+                let _ = roots.add(cert);
+            }
+            if let Some(pem) = extra_roots_pem {
+                add_pem_roots(&mut roots, pem)?;
+            }
+            RustlsClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        // The other modes never look at the certificate, so extra roots
+        // have nothing to do there.
         _ => RustlsClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(std::sync::Arc::new(NoCertVerifier))
             .with_no_client_auth(),
     };
     Ok(cfg)
+}
+
+/// Add every certificate in `pem` to `roots`. Fails closed: input the
+/// caller meant as trust anchors but that yields none (or any that will
+/// not parse) is an error, never a silent fall-back to the system roots —
+/// the caller would believe it had pinned a CA it had not.
+fn add_pem_roots(roots: &mut rustls::RootCertStore, pem: &str) -> Result<(), PgError> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let mut added = 0usize;
+    for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+        let cert =
+            cert.map_err(|e| PgError::Tls(format!("custom root certificates: invalid PEM: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| PgError::Tls(format!("custom root certificates: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(PgError::Tls(
+            "custom root certificates: no certificate found in the PEM".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn classify_connect_error(e: tokio_postgres::Error) -> PgError {
@@ -973,7 +1007,35 @@ fn classify_connect_error(e: tokio_postgres::Error) -> PgError {
             return PgError::Auth(db_err.message().to_string());
         }
     }
-    PgError::Connect(e.to_string())
+    // tokio-postgres reports a failed handshake as the bare "error
+    // performing TLS handshake"; the reason (unknown issuer, wrong host
+    // name, expired) lives in the source chain. Surface it, and as a TLS
+    // error, so callers can tell "server not trusted" from "server down".
+    let detail = error_chain(&e);
+    if is_tls_handshake_failure(&e) {
+        PgError::Tls(detail)
+    } else {
+        PgError::Connect(detail)
+    }
+}
+
+fn is_tls_handshake_failure(e: &tokio_postgres::Error) -> bool {
+    e.to_string().contains("TLS handshake")
+}
+
+/// `outer: cause: root cause`, skipping causes that only repeat their parent.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !out.ends_with(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
 }
 
 fn spawn_connection<S, T>(
@@ -1068,6 +1130,107 @@ mod tests {
         let cfg = PgConfig::local("db", "u");
         let driver = build_driver_config(&cfg).expect("driver cfg");
         assert!(driver.get_password().is_none());
+    }
+
+    /// Self-signed test root (CN "pgAgent Test Root CA"); nothing trusts it.
+    const TEST_ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIC5DCCAcygAwIBAgIJAIHy26Wj2djmMA0GCSqGSIb3DQEBCwUAMB8xHTAbBgNV\n\
+BAMMFHBnQWdlbnQgVGVzdCBSb290IENBMB4XDTI2MTExMDA2MDgyN1oXDTM2MTEw\n\
+NzA2MDgyN1owHzEdMBsGA1UEAwwUcGdBZ2VudCBUZXN0IFJvb3QgQ0EwggEiMA0G\n\
+CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCwOC6/1iJu/3ADm+Gu3JJ45oSm6a/J\n\
+0qA65610AKQDTlSNGWo9DeDHPvUor3MTrucJidsaUhqDB4mayZlK027IpnwiVEIn\n\
+e90xlaUgSTZtq2E4nAwv5J1dFPnyYeb/QmgaS2ksywNjjse3Bmtuh2iQb9cWJTnk\n\
+If8hZieml1j71h4YuXmUXrEVLGqCtf57TAR71iHpvPDf+LB8OcIZXGSZQ3pQ+rK3\n\
+u5Ynm68kgBR33V8pyTIQNWMlfBWvnkz07H2A15D5iTBjx+jeaOGoArtFOzh7nx9a\n\
+mmDHXxezOXaUsacqJJboRmqupwBuyoMrt3sEhwtqRy/YSXfYsUWlIXnNAgMBAAGj\n\
+IzAhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEB\n\
+CwUAA4IBAQAkWCsCfNUQlUCLg4HzJVZ+OoLr5HsvYTPxjbiCgaFt7WslU0CmtfBG\n\
+jmopzLMhiAN4WH3HFWfd5gz63IgQ0naotbfmtDMUr7k3ksVdADmGsIVVAoNDWerQ\n\
+hhM8rX2nucSs5x44QT67XW8pQoxrAw++6U/zKAIR+nV8wH9vJee1M6ZpqANIPwqc\n\
+VBCZIdJt5Wz432qI2VpcjcaG9jRp/ZsNP5FMsXIZ3rInQ361L99zxPvad0szyhAN\n\
+OuxxUeCApuIsj+BTYmd1lIIP6+/Qzo8eRvJGA6VYAHy77TQdRSz3RaTNfppaZT39\n\
+0/IiX/caBTFQnFSJLC21zNlFrmle1FAk\n\
+-----END CERTIFICATE-----\n";
+
+    fn roots_from(pem: &str) -> Result<usize, PgError> {
+        let mut roots = rustls::RootCertStore::empty();
+        add_pem_roots(&mut roots, pem)?;
+        Ok(roots.len())
+    }
+
+    #[test]
+    fn error_chain_appends_causes_without_repeating_them() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|l| l as _)
+            }
+        }
+        let err = Layer(
+            "error performing TLS handshake",
+            Some(Box::new(Layer(
+                "invalid peer certificate: UnknownIssuer",
+                Some(Box::new(Layer(
+                    "invalid peer certificate: UnknownIssuer",
+                    None,
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error performing TLS handshake: invalid peer certificate: UnknownIssuer"
+        );
+    }
+
+    #[test]
+    fn pem_roots_are_added_one_per_certificate() {
+        assert_eq!(roots_from(TEST_ROOT_PEM).expect("one cert"), 1);
+        // A bundle (RDS ships dozens in one file) adds each entry, and
+        // text around the blocks is ignored as PEM allows.
+        let bundle = format!("# provider bundle\n{TEST_ROOT_PEM}\n{TEST_ROOT_PEM}");
+        assert_eq!(roots_from(&bundle).expect("two certs"), 2);
+    }
+
+    #[test]
+    fn pem_without_a_certificate_is_an_error_not_a_silent_fallback() {
+        for pem in ["", "   \n", "not pem at all"] {
+            let err = roots_from(pem).expect_err("must not be accepted");
+            assert!(matches!(err, PgError::Tls(_)), "{pem:?} -> {err:?}");
+            assert!(err.to_string().contains("no certificate found"), "{err}");
+        }
+    }
+
+    #[test]
+    fn malformed_certificate_is_rejected() {
+        // Valid PEM armour around bytes that are not a certificate, and
+        // armour whose base64 body is broken.
+        let not_a_cert =
+            "-----BEGIN CERTIFICATE-----\naGVsbG8gd29ybGQ=\n-----END CERTIFICATE-----\n";
+        let broken = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        for pem in [not_a_cert, broken] {
+            let err = roots_from(pem).expect_err("must not be accepted");
+            assert!(matches!(err, PgError::Tls(_)), "{pem:?} -> {err:?}");
+        }
+    }
+
+    #[test]
+    fn rustls_config_validates_custom_roots_only_for_verify_full() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        assert!(build_rustls_config(PgTlsMode::VerifyFull, Some(TEST_ROOT_PEM)).is_ok());
+        assert!(build_rustls_config(PgTlsMode::VerifyFull, None).is_ok());
+        assert!(matches!(
+            build_rustls_config(PgTlsMode::VerifyFull, Some("garbage")),
+            Err(PgError::Tls(_))
+        ));
+        // Unverified modes ignore the field entirely.
+        assert!(build_rustls_config(PgTlsMode::Require, Some("garbage")).is_ok());
+        assert!(build_rustls_config(PgTlsMode::Prefer, Some("garbage")).is_ok());
     }
 
     #[test]

@@ -25,7 +25,66 @@ fn pg_config() -> Option<PgConfig> {
         max_pool_size: Some(3),
         idle_timeout_secs: Some(1),
         min_idle_connections: Some(0),
+        tls_root_certs_pem: None,
     })
+}
+
+/// TLS tier: needs a server presenting a certificate issued by a private
+/// CA. Set `PG_TEST_TLS_ROOT_PEM` to that CA's PEM file (and, to prove an
+/// unrelated root is not enough, `PG_TEST_TLS_OTHER_ROOT_PEM`). Skipped
+/// otherwise.
+#[tokio::test]
+async fn verify_full_accepts_a_private_ca_only_when_it_is_supplied() {
+    let Some(base) = pg_config() else {
+        return;
+    };
+    let Ok(root_path) = env::var("PG_TEST_TLS_ROOT_PEM") else {
+        eprintln!("SKIP: PG_TEST_TLS_ROOT_PEM not set");
+        return;
+    };
+    let root = std::fs::read_to_string(root_path).expect("read PG_TEST_TLS_ROOT_PEM");
+    let verify_full = |roots: Option<String>| PgConfig {
+        tls: PgTlsMode::VerifyFull,
+        tls_root_certs_pem: roots,
+        ..base.clone()
+    };
+
+    // System roots alone do not know the private CA.
+    let err = PgPool::connect(verify_full(None))
+        .await
+        .err()
+        .expect("a private CA must not verify against system roots");
+    assert!(
+        matches!(err, ssh_commander_pg::PgError::Tls(_)),
+        "an untrusted server is a TLS error, not a generic connect failure: {err:?}"
+    );
+    assert!(
+        err.to_string().to_lowercase().contains("certificate"),
+        "the reason must be in the message: {err}"
+    );
+
+    // An unrelated root does not help either.
+    if let Ok(other_path) = env::var("PG_TEST_TLS_OTHER_ROOT_PEM") {
+        let other = std::fs::read_to_string(other_path).expect("read other root");
+        assert!(
+            PgPool::connect(verify_full(Some(other))).await.is_err(),
+            "an unrelated root must not make the server trusted"
+        );
+    }
+
+    // The server's own CA does.
+    let pool = PgPool::connect(verify_full(Some(root)))
+        .await
+        .expect("verify-full with the server's CA");
+    let out = pool
+        .execute(
+            "tls",
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            1,
+        )
+        .await
+        .expect("query over verified TLS");
+    assert_eq!(out.rows[0][0].as_deref(), Some("t"));
 }
 
 async fn pool() -> Option<std::sync::Arc<PgPool>> {
