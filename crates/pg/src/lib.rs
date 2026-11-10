@@ -1201,7 +1201,7 @@ OuxxUeCApuIsj+BTYmd1lIIP6+/Qzo8eRvJGA6VYAHy77TQdRSz3RaTNfppaZT39\n\
     fn pem_without_a_certificate_is_an_error_not_a_silent_fallback() {
         for pem in ["", "   \n", "not pem at all"] {
             let err = roots_from(pem).expect_err("must not be accepted");
-            assert!(matches!(err, PgError::Tls(_)), "{pem:?} -> {err:?}");
+            assert!(matches!(err, PgError::Tls(_)), "{err:?}");
             assert!(err.to_string().contains("no certificate found"), "{err}");
         }
     }
@@ -1215,7 +1215,7 @@ OuxxUeCApuIsj+BTYmd1lIIP6+/Qzo8eRvJGA6VYAHy77TQdRSz3RaTNfppaZT39\n\
         let broken = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
         for pem in [not_a_cert, broken] {
             let err = roots_from(pem).expect_err("must not be accepted");
-            assert!(matches!(err, PgError::Tls(_)), "{pem:?} -> {err:?}");
+            assert!(matches!(err, PgError::Tls(_)), "{err:?}");
         }
     }
 
