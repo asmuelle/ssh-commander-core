@@ -3,7 +3,7 @@ version = 2
 yanked = "deny"
 ignore = [
     # rsa: Marvin timing side-channel. No fixed release exists; pulled in
-    # transitively via russh 0.62 → rsa for RSA key support.
+    # transitively via russh 0.65 → rsa 0.10.0-rc for RSA key support.
     # Low practical risk for an interactive SSH client; revisit when the
     # rsa crate ships a constant-time fix.
     "RUSTSEC-2023-0071",

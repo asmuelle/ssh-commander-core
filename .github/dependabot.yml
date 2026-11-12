@@ -1,11 +1,24 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
+# Dependabot version updates. Security updates are enabled separately in
+# the repository settings; this file keeps routine bumps flowing so
+# advisories land on an already-current tree.
 version: 2
 updates:
-  - package-ecosystem: "" # See documentation for possible values
-    directory: "/" # Location of package manifests
-    schedule: 
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
       interval: "weekly"
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      # The ref is the Rust toolchain version (the MSRV pin), not the
+      # action's release; bumping it breaks the msrv job.
+      - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      actions:
+        patterns: ["*"]
