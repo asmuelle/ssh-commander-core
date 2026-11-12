@@ -22,7 +22,7 @@ thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tokio-postgres = { version = "0.7", features = ["runtime", "with-chrono-0_4"] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.8"
 
