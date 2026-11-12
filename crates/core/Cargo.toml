@@ -53,7 +53,7 @@ thiserror = "2"
 tracing = "0.1"
 tokio-util = "0.7"
 futures = "0.3"
-suppaftp = { version = "10.0.2", features = ["tokio-async-native-tls"], optional = true }
+suppaftp = { version = "12.2.1", features = ["tokio-async-native-tls"], optional = true }
 dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
