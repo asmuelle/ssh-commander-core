@@ -199,12 +199,16 @@ fn parse_dig_lines(out: &str) -> Vec<String> {
         .collect()
 }
 
-/// Reject hostnames containing shell metacharacters. DNS names can never
+/// Strip shell metacharacters from a hostname. DNS names can never
 /// validly contain these — anything else is an injection attempt.
+/// Leading dashes are dropped too, so the name can't be read as a `dig`
+/// option (a hostname label can't start with `-` anyway).
 fn shell_safe(name: &str) -> String {
-    name.chars()
+    let filtered: String = name
+        .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        .collect()
+        .collect();
+    filtered.trim_start_matches('-').to_string()
 }
 
 // Allow ToolsError to surface here for FFI parity even though the public
@@ -238,6 +242,14 @@ mod tests {
         assert_eq!(shell_safe("foo$(bad)"), "foobad");
     }
 
+    #[test]
+    fn shell_safe_strips_leading_dashes_so_name_is_not_a_dig_option() {
+        assert_eq!(shell_safe("-f/etc/passwd"), "fetcpasswd");
+        assert_eq!(shell_safe("--x.example.com"), "x.example.com");
+        assert_eq!(shell_safe(" -k.example"), "k.example");
+        assert_eq!(shell_safe("my-host.example"), "my-host.example");
+    }
+
     proptest! {
         #[test]
         fn shell_safe_only_emits_dns_safe_characters(input in ".*") {
@@ -245,6 +257,7 @@ mod tests {
             prop_assert!(sanitized
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+            prop_assert!(!sanitized.starts_with('-'));
         }
     }
 }

@@ -209,11 +209,45 @@ impl HostKeyStore {
                 content.push('\n');
             }
         }
-        tokio::fs::write(&self.path, content)
-            .await
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        // Write to a sibling temp file and rename over the store, so a crash
+        // mid-write can't leave a truncated file. A truncated store would
+        // silently drop pinned keys, and the next connect would TOFU-trust
+        // whatever key the server offers.
+        let tmp_path = self.temp_path();
+        if let Err(e) = write_owner_only(&tmp_path, content.as_bytes()).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e).with_context(|| format!("failed to write {}", tmp_path.display()));
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, &self.path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e).with_context(|| format!("failed to write {}", self.path.display()));
+        }
         Ok(())
     }
+
+    fn temp_path(&self) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| "known_hosts".into());
+        name.push(format!(".tmp-{}", std::process::id()));
+        self.path.with_file_name(name)
+    }
+}
+
+/// Create (or truncate) `path` with mode 0600 on Unix, write `bytes` and
+/// fsync, so the store is durable before it is renamed into place.
+async fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await
 }
 
 /// Compute an SHA-256 fingerprint from a stored base64 public-key blob,
@@ -260,7 +294,7 @@ mod tests {
     /// / `clone_public_key` API is no longer available.
     ///
     /// Use `russh::keys::key::safe_rng()` for a compatible `CryptoRng` — russh
-    /// uses rand 0.10 internally, which is not the same as rand 0.8 in the core crate.
+    /// uses rand 0.10 internally; the core crate has no direct rand dependency.
     fn test_public_key() -> russh::keys::PublicKey {
         russh::keys::PrivateKey::random(
             &mut russh::keys::key::safe_rng(),
@@ -282,6 +316,49 @@ mod tests {
             .expect_err("directory path must not be treated as an empty store");
 
         assert!(err.to_string().contains("failed to read known_hosts"));
+    }
+
+    #[tokio::test]
+    async fn trust_writes_store_atomically_without_leftover_temp_files() {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("known_hosts");
+        let store = HostKeyStore::new(path.clone());
+        let key = test_public_key();
+
+        store.trust("host", 22, &key).await.expect("trust");
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["known_hosts".to_string()]);
+
+        let reloaded = HostKeyStore::new(path);
+        assert!(matches!(
+            reloaded.verify("host", 22, &key).await.expect("verify"),
+            Verdict::Known
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trust_creates_store_readable_only_by_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("known_hosts");
+        let store = HostKeyStore::new(path.clone());
+
+        store
+            .trust("host", 22, &test_public_key())
+            .await
+            .expect("trust");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[tokio::test]

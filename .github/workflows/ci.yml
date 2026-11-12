@@ -97,13 +97,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
-      # Ignored advisories mirror deny.toml's [advisories].ignore — all are
-      # unfixable transitive deps (rsa Marvin timing; rand unsound edge
-      # case). See deny.toml for rationale.
+      # Ignored advisories mirror deny.toml's [advisories].ignore — only the
+      # unfixable transitive rsa Marvin timing issue. See deny.toml.
       - run: >-
           cargo audit
           --ignore RUSTSEC-2023-0071
-          --ignore RUSTSEC-2026-0097
       - run: cargo deny check advisories bans licenses sources
 
   coverage:
