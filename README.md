@@ -28,9 +28,9 @@ Pull in only what you need: the core crate has zero arrow/parquet weight unless 
 
 ```toml
 [dependencies]
-ssh-commander-core = "0.1"
+ssh-commander-core = "0.4"
 # Optional: Parquet export for the Postgres explorer
-ssh-commander-pg-parquet = "0.1"
+ssh-commander-pg-parquet = "0.4"
 ```
 
 Requires Rust **1.95+** (edition 2024).
