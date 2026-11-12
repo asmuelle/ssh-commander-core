@@ -15,6 +15,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # The ref is the Rust toolchain version (the MSRV pin), not the
+      # action's release; bumping it breaks the msrv job.
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
       actions:
         patterns: ["*"]

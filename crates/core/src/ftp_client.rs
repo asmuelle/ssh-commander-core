@@ -277,7 +277,7 @@ impl FtpClient {
             local_file.flush().map_err(|e| {
                 TransferError::operation(format!("Failed to flush local file: {}", e))
             })?;
-            s.finalize_retr_stream(data_stream).await.map_err(|e| {
+            data_stream.finish().await.map_err(|e| {
                 TransferError::operation(format!("Failed to finalize download: {}", e))
             })?;
             total
@@ -315,7 +315,7 @@ impl FtpClient {
                 })?;
                 total += n as u64;
             }
-            s.finalize_put_stream(data_stream).await.map_err(|e| {
+            data_stream.finish().await.map_err(|e| {
                 TransferError::operation(format!("Failed to finalize upload: {}", e))
             })?;
             total

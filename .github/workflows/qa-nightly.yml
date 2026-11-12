@@ -32,7 +32,7 @@ jobs:
       SSH_TEST_USER: testuser
       SSH_TEST_PASSWORD: testpass
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Wait for OpenSSH
@@ -68,7 +68,7 @@ jobs:
       FTP_TEST_USER: testuser
       FTP_TEST_PASS: testpass
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Wait for FTP
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -101,7 +101,7 @@ jobs:
     timeout-minutes: 45
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2

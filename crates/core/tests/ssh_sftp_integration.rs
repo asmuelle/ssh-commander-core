@@ -16,12 +16,22 @@ fn ssh_config() -> Option<SshConfig> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(22);
     let username = env::var("SSH_TEST_USER").unwrap_or_else(|_| "testuser".to_string());
-    let password = env::var("SSH_TEST_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
+    // Key auth when SSH_TEST_KEY_PATH is set (e.g. a key-only test sshd),
+    // otherwise password auth.
+    let auth_method = match env::var("SSH_TEST_KEY_PATH") {
+        Ok(key_path) => AuthMethod::PublicKey {
+            key_path,
+            passphrase: env::var("SSH_TEST_KEY_PASSPHRASE").ok(),
+        },
+        Err(_) => AuthMethod::Password {
+            password: env::var("SSH_TEST_PASSWORD").unwrap_or_else(|_| "testpass".to_string()),
+        },
+    };
     Some(SshConfig {
         host,
         port,
         username,
-        auth_method: AuthMethod::Password { password },
+        auth_method,
     })
 }
 
@@ -63,7 +73,14 @@ async fn sftp_crud_smoke() {
         username: ssh.username,
         auth_method: match ssh.auth_method {
             AuthMethod::Password { password } => SftpAuthMethod::Password { password },
-            _ => unreachable!("test helper only creates password auth"),
+            AuthMethod::PublicKey {
+                key_path,
+                passphrase,
+            } => SftpAuthMethod::PublicKey {
+                key_path,
+                passphrase,
+            },
+            _ => unreachable!("test helper only creates password or key auth"),
         },
     };
     let mut client = StandaloneSftpClient::connect(&cfg, host_keys())
