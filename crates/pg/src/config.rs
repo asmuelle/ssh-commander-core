@@ -44,18 +44,27 @@ impl std::fmt::Debug for PgAuthMethod {
 /// Modeled after libpq's `sslmode`. The MVP supports the four most useful
 /// values; `allow` is omitted because it negotiates plaintext on failure
 /// and silently weakens security in a way no UI affordance can clarify.
+///
+/// The default is [`PgTlsMode::VerifyFull`], which is also what a saved
+/// profile without a `tls` field deserializes to. Every weaker mode is an
+/// explicit opt-in: a server without TLS needs [`PgTlsMode::Disable`], and
+/// one whose certificate can't be verified needs a CA in
+/// [`PgConfig::tls_root_certs_pem`] (or, knowingly, [`PgTlsMode::Require`]).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum PgTlsMode {
     /// Never use TLS.
     Disable,
-    /// Try TLS, fall back to plaintext on negotiation failure.
-    #[default]
+    /// Try TLS without verifying the certificate, and fall back to
+    /// plaintext if the server doesn't offer TLS. An on-path attacker can
+    /// force either, so this protects only against passive eavesdropping.
     Prefer,
-    /// Require TLS, but do not verify the server certificate.
+    /// Require TLS, but do not verify the server certificate. Protects
+    /// against passive eavesdropping, not against an on-path attacker.
     Require,
     /// Require TLS and validate the server certificate (chain and host
     /// name) against the system roots plus any
     /// [`PgConfig::tls_root_certs_pem`].
+    #[default]
     VerifyFull,
 }
 
@@ -106,6 +115,15 @@ pub struct PgConfig {
     /// [`PgError::Tls`]: crate::PgError::Tls
     #[serde(default)]
     pub tls_root_certs_pem: Option<String>,
+    /// IP address to dial instead of resolving [`PgConfig::host`]
+    /// (libpq's `hostaddr`). `host` is still the name the server
+    /// certificate must match under [`PgTlsMode::VerifyFull`].
+    ///
+    /// ssh-commander-core sets this to the loopback end of an SSH tunnel,
+    /// so a tunneled connection is verified against the real database
+    /// host rather than `127.0.0.1`.
+    #[serde(default)]
+    pub hostaddr: Option<std::net::IpAddr>,
 }
 
 impl PgConfig {
@@ -127,6 +145,7 @@ impl PgConfig {
             idle_timeout_secs: None,
             min_idle_connections: None,
             tls_root_certs_pem: None,
+            hostaddr: None,
         }
     }
 }
@@ -147,8 +166,22 @@ mod tests {
     }
 
     #[test]
-    fn tls_mode_default_is_prefer() {
-        assert_eq!(PgTlsMode::default(), PgTlsMode::Prefer);
+    fn tls_mode_default_is_verify_full() {
+        assert_eq!(PgTlsMode::default(), PgTlsMode::VerifyFull);
+    }
+
+    #[test]
+    fn profile_without_tls_field_deserializes_to_verify_full() {
+        let json = r#"{
+            "host": "db.example.com",
+            "port": 5432,
+            "database": "app",
+            "user": "svc",
+            "auth": { "Keychain": { "account": "postgres:profile-1" } }
+        }"#;
+        let cfg: PgConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(cfg.tls, PgTlsMode::VerifyFull);
+        assert_eq!(cfg.hostaddr, None);
     }
 
     #[test]
@@ -168,6 +201,7 @@ mod tests {
             idle_timeout_secs: Some(120),
             min_idle_connections: Some(0),
             tls_root_certs_pem: Some("-----BEGIN CERTIFICATE-----\n".to_string()),
+            hostaddr: Some(std::net::IpAddr::from([10, 0, 0, 7])),
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: PgConfig = serde_json::from_str(&json).expect("deserialize");
@@ -177,6 +211,7 @@ mod tests {
         assert_eq!(back.idle_timeout_secs, Some(120));
         assert_eq!(back.min_idle_connections, Some(0));
         assert_eq!(back.tls_root_certs_pem, cfg.tls_root_certs_pem);
+        assert_eq!(back.hostaddr, cfg.hostaddr);
     }
 
     #[test]
