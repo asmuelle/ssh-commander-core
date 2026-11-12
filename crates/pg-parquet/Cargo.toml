@@ -14,9 +14,9 @@ keywords = ["parquet", "arrow", "postgres", "export"]
 categories = ["database", "encoding"]
 
 [dependencies]
-parquet = "54"
-arrow-array = "54"
-arrow-schema = "54"
+parquet = "59"
+arrow-array = "59"
+arrow-schema = "59"
 thiserror = "2"
 
 [dev-dependencies]
