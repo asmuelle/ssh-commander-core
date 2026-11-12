@@ -37,11 +37,66 @@ pub struct FtpConfig {
     pub password: String,
     pub ftps_enabled: bool,
     pub anonymous: bool,
-    /// Explicit opt-in to skip TLS certificate validation for FTPS. Defaults to
-    /// `false` so an untrusted/self-signed cert aborts the handshake. The
-    /// frontend must set this to `true` *with the user's informed consent*.
+    /// Extra trust anchors for FTPS: one or more PEM-encoded certificates,
+    /// trusted **in addition to** the system roots.
+    ///
+    /// For a server with a self-signed certificate, pass that certificate;
+    /// for a private CA, pass the CA. The host name is still checked against
+    /// the certificate either way. Certificate validation can't be turned
+    /// off. Malformed PEM, or PEM with no certificate in it, fails the
+    /// connect with [`FtpError::Tls`] rather than silently falling back to
+    /// the system roots. Ignored for plain FTP.
+    ///
+    /// Saved profiles from before 0.4 may still carry `allow_invalid_certs`;
+    /// it is ignored.
     #[serde(default)]
-    pub allow_invalid_certs: bool,
+    pub tls_root_certs_pem: Option<String>,
+}
+
+const PEM_CERTIFICATE_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const PEM_CERTIFICATE_END: &str = "-----END CERTIFICATE-----";
+
+/// Parse every `CERTIFICATE` block in `pem`. Fails closed: a block without
+/// an END line, a block that doesn't parse, or no block at all is an error.
+/// Error messages never echo the PEM itself.
+fn parse_pem_certificates(
+    pem: &str,
+) -> Result<Vec<suppaftp::async_native_tls::Certificate>, FtpError> {
+    let invalid = |reason: String| FtpError::Tls {
+        message: format!("custom root certificates: {reason}"),
+    };
+    let mut certs = Vec::new();
+    let mut rest = pem;
+    while let Some(start) = rest.find(PEM_CERTIFICATE_BEGIN) {
+        let block_and_rest = &rest[start..];
+        let end = block_and_rest
+            .find(PEM_CERTIFICATE_END)
+            .ok_or_else(|| invalid("a certificate block has no END line".to_string()))?
+            + PEM_CERTIFICATE_END.len();
+        let cert =
+            suppaftp::async_native_tls::Certificate::from_pem(&block_and_rest.as_bytes()[..end])
+                .map_err(|e| invalid(format!("certificate {} is invalid: {e}", certs.len() + 1)))?;
+        certs.push(cert);
+        rest = &block_and_rest[end..];
+    }
+    if certs.is_empty() {
+        return Err(invalid("no certificate found in the PEM".to_string()));
+    }
+    Ok(certs)
+}
+
+/// The FTPS TLS connector: system roots plus `extra_roots_pem`, with
+/// certificate and host-name validation always on.
+fn build_tls_connector(
+    extra_roots_pem: Option<&str>,
+) -> Result<suppaftp::async_native_tls::TlsConnector, FtpError> {
+    let mut connector = suppaftp::async_native_tls::TlsConnector::new();
+    if let Some(pem) = extra_roots_pem {
+        for cert in parse_pem_certificates(pem)? {
+            connector = connector.add_root_certificate(cert);
+        }
+    }
+    Ok(connector)
 }
 
 /// Wrapper enum to handle both plain and TLS FTP streams.
@@ -102,14 +157,7 @@ impl FtpClient {
 
             tracing::info!("FTPS TCP connected, starting TLS handshake...");
 
-            let mut tls_connector = suppaftp::async_native_tls::TlsConnector::new();
-            if config.allow_invalid_certs {
-                tracing::warn!(
-                    "FTPS: TLS certificate validation DISABLED for {} — insecure, user opt-in",
-                    config.host
-                );
-                tls_connector = tls_connector.danger_accept_invalid_certs(true);
-            }
+            let tls_connector = build_tls_connector(config.tls_root_certs_pem.as_deref())?;
             let secure_stream = ftp_stream
                 .into_secure(
                     suppaftp::tokio::AsyncNativeTlsConnector::from(tls_connector),
@@ -119,7 +167,8 @@ impl FtpClient {
                 .map_err(|e| FtpError::Tls {
                     message: format!(
                         "FTPS TLS handshake failed: {}. \
-                         If the server uses a self-signed certificate, re-connect with 'Allow invalid TLS certificates' enabled.",
+                         If the server uses a self-signed certificate or a private CA, \
+                         add that certificate as a trusted root certificate.",
                         e
                     ),
                 })?;
@@ -470,8 +519,218 @@ mod tests {
             password: pass,
             ftps_enabled: false,
             anonymous: false,
-            allow_invalid_certs: false,
+            tls_root_certs_pem: None,
         })
+    }
+
+    // ---- FTPS trust anchors (no server needed) ----------------------------
+
+    mod tls_trust {
+        use super::super::*;
+        use native_tls::Identity;
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose,
+        };
+        use suppaftp::async_native_tls::TlsAcceptor;
+
+        // Throwaway RSA-2048 key, used only to stand up the in-process test
+        // server. macOS's native-tls imports RSA keys but not EC ones for a
+        // server identity, and rcgen on ring can't generate RSA keys.
+        // Certificates are still generated per run, so nothing here expires.
+        const TEST_SERVER_RSA_KEY: &str = "\
+-----BEGIN PRIVATE KEY-----\n\
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQC1hkTB9s65EMRp\n\
+trhakYLii8Rb/I2o//fe8Pw+aRWBT1egp/54HdQDTDXxGFt2p263xplhNbLmllmt\n\
+YpljewNonrIVfKkJ3IZk4TI5HzdQfxrZ+rmLXvKjCcZk6aE8AGl1qsdzpcakdIXe\n\
+gPFC72vyqGGPCt+h6c1/EN9k940b5OE69c5Yc1WTC7tlPvPNOzURck1frNzlpM1F\n\
+YWFJrQCrsBU4kkE0WI98uOuRz59vGAbr/uZM8Q7nBfUlODAJr2z/IV/wCmihqSq3\n\
+cgSl91G570GCpxREhSyZN3OWIwVriLFeRslOXDmaFxIwWrPZoS+076FkRY96PACG\n\
+7AnJO+oLAgMBAAECgf9YCvJOdubNMX9nxrf5NZpwnFnLmTMcRQp0QhjA1zcXAOSq\n\
+MiZlHBKOMZNNh1gqtLV+wqn3UZRJQviRSsFwVA8ohHrbm8W2gr9XLo1YJ0vXlHlG\n\
+6yoTRHoVmdLKyduUvp5n8+0eqnPY+qtIwEGZtYZ7Vi/7W8rGksqZAWtYuA44+Hkf\n\
+6R6/7NwdOIhMOJv/OyFZrbGdBKL2kC1PtmqWAtVgfSSoC4m7xMSvgF5yuyvImohe\n\
+kPkUvblVxlszG8J9AfaKV20/CUWpLu1/gxJ6VSIrBvmn/Dc/eabgogGVY9tdDMwc\n\
+9TKbi2CTrjhvsU6Zw13CLBAvgrFIhaq2p1FojokCgYEA23cnA89xJVeeHxMAPWpX\n\
+70p0XAdss9Efwl1gnBwiAFcFG8jqSuY7a7hHrhhLDGKPB8cMC3seQZTDsWpzxW5c\n\
+LGapBNXW/DMg03zMfwuwWxBjYUUSM3oEjw7LLE21CNd/mJWzsROOW+rghb24NwUk\n\
+nvCkeYWphW/heJYPsGYGAIMCgYEA0740r77dMd57vZ1RzaWJUwLVTd17x4eQx9CF\n\
+SIOZQYG0je0Izo7FKxPzXIE3A2I377ygXcfCtcw/dvtw/+I/bCMCj371iIvVIT/s\n\
+2c+8QOJBs4jqtFOO6Rkgk88AJlJAbrJmeE9EGplyEeBuGUL9JjLciGCw6HJfcc6G\n\
+YNHFqdkCgYEA2Gvj+Ynz1hNVRueB8Q6RsNQHc0mPFLRBUXar8sZ7cUJfM0sqYLoy\n\
+FsQfS7uBJrF6wvyzEA9Vgu6lHKwRhrySAOcr/iyyWPpCgMwtDYwFWYgLuLxYepL1\n\
+M+4uxX3L7PA2T84w6YqTdGlnB/xTUU6tEl/UklIRHhl6i2PQDPBPMukCgYAcOZ6M\n\
+TsTtgNq9y9q7rvU/O4Fzf7KgRlHmUMVzhRdIxCFtScuCvUVLGL239wF+Ufli26IE\n\
+3jv2P+O12I6XjXEm2QPeXO4d5YXjiMHpxucxPvfDFt0ybHEAYXkWOuGqOgyctOsz\n\
+3l0Vrp6mA2SpuWRFU0JSa5EpaxWN9hmzjkLrAQKBgQCJhqCElzrp7pDuHmK305rp\n\
+A+kTfnm/695KyWr/NPwnfaQsIUmHZQwoSypnS7xy9ittrduUQqBdtjwK22u8wrWw\n\
+9xyR5VDylZJ6yBfJQ0r5MU/zqeP1wWdeGLcn3bDoNpLaiDJRcRX9Td+ZqSLYamTW\n\
+ea4hFZ1Agq/uAmbbCFmPBQ==\n\
+-----END PRIVATE KEY-----\n\
+";
+
+        /// A throwaway CA. rcgen's default validity starts in 1975, which keeps
+        /// these certificates clear of Apple's 825-day limit (it only applies
+        /// to certificates issued from July 2019 on).
+        fn new_ca(name: &str) -> (Issuer<'static, KeyPair>, String) {
+            let key = KeyPair::generate().expect("ca key");
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+            params.distinguished_name.push(DnType::CommonName, name);
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let pem = params.self_signed(&key).expect("ca cert").pem();
+            (Issuer::new(params, key), pem)
+        }
+
+        /// A `localhost` server certificate and its PKCS#8 key, signed by
+        /// `issuer` or self-signed.
+        fn server_cert(issuer: Option<&Issuer<'static, KeyPair>>) -> (String, String) {
+            let key = KeyPair::from_pem(TEST_SERVER_RSA_KEY).expect("server key");
+            let mut params =
+                CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "localhost");
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            let cert = match issuer {
+                Some(issuer) => params.signed_by(&key, issuer),
+                None => params.self_signed(&key),
+            }
+            .expect("server cert");
+            (cert.pem(), key.serialize_pem())
+        }
+
+        /// Accept one TLS connection with `cert_pem`/`key_pem`, then handshake
+        /// from the client side with the FTPS connector built from `roots`,
+        /// asking for `server_name`.
+        async fn handshake(
+            cert_pem: &str,
+            key_pem: &str,
+            roots: Option<&str>,
+            server_name: &str,
+        ) -> Result<(), String> {
+            let identity =
+                Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).expect("identity");
+            let acceptor =
+                TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).expect("acceptor"));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = tokio::spawn(async move {
+                if let Ok((tcp, _)) = listener.accept().await {
+                    let _ = acceptor.accept(tcp).await;
+                }
+            });
+
+            let connector = build_tls_connector(roots).map_err(|e| e.to_string())?;
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let result = connector
+                .connect(server_name, tcp)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            server.abort();
+            result
+        }
+
+        #[tokio::test]
+        async fn ca_signed_server_is_trusted_through_its_ca() {
+            let (ca, ca_pem) = new_ca("ftps test ca");
+            let (cert, key) = server_cert(Some(&ca));
+            handshake(&cert, &key, Some(&ca_pem), "localhost")
+                .await
+                .expect("the server's CA must be trusted");
+        }
+
+        #[tokio::test]
+        async fn self_signed_server_is_trusted_through_its_own_certificate() {
+            let (cert, key) = server_cert(None);
+            handshake(&cert, &key, Some(&cert), "localhost")
+                .await
+                .expect("a self-signed server is trusted via its own certificate");
+        }
+
+        #[tokio::test]
+        async fn untrusted_server_is_rejected_without_extra_roots() {
+            let (ca, _) = new_ca("ftps test ca");
+            let (cert, key) = server_cert(Some(&ca));
+            assert!(handshake(&cert, &key, None, "localhost").await.is_err());
+        }
+
+        #[tokio::test]
+        async fn unrelated_root_does_not_make_the_server_trusted() {
+            let (ca, _) = new_ca("ftps test ca");
+            let (_, other_pem) = new_ca("unrelated ca");
+            let (cert, key) = server_cert(Some(&ca));
+            assert!(
+                handshake(&cert, &key, Some(&other_pem), "localhost")
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn trusted_certificate_for_another_host_is_rejected() {
+            let (ca, ca_pem) = new_ca("ftps test ca");
+            let (cert, key) = server_cert(Some(&ca));
+            assert!(
+                handshake(&cert, &key, Some(&ca_pem), "other-host.example")
+                    .await
+                    .is_err(),
+                "the host name must still be checked"
+            );
+        }
+
+        #[test]
+        fn malformed_root_pem_is_rejected() {
+            let err = build_tls_connector(Some("not a certificate"))
+                .expect_err("garbage must not be accepted");
+            assert!(matches!(err, FtpError::Tls { .. }), "{err}");
+        }
+
+        #[test]
+        fn pem_without_a_certificate_is_rejected() {
+            let key_only = KeyPair::generate().expect("key").serialize_pem();
+            assert!(matches!(
+                build_tls_connector(Some(&key_only)),
+                Err(FtpError::Tls { .. })
+            ));
+        }
+
+        #[test]
+        fn truncated_certificate_block_is_rejected() {
+            let (_, ca_pem) = new_ca("ftps test ca");
+            let truncated = &ca_pem[..ca_pem.len() / 2];
+            assert!(matches!(
+                build_tls_connector(Some(truncated)),
+                Err(FtpError::Tls { .. })
+            ));
+        }
+
+        #[test]
+        fn bundle_with_several_certificates_is_parsed() {
+            let (_, a) = new_ca("ca a");
+            let (_, b) = new_ca("ca b");
+            let bundle = format!("{a}\n{b}");
+            assert_eq!(parse_pem_certificates(&bundle).expect("bundle").len(), 2);
+        }
+
+        #[test]
+        fn legacy_allow_invalid_certs_field_is_ignored() {
+            let json = r#"{
+                "host": "ftp.example.com",
+                "port": 21,
+                "username": "u",
+                "password": "p",
+                "ftps_enabled": true,
+                "anonymous": false,
+                "allow_invalid_certs": true
+            }"#;
+            let cfg: FtpConfig = serde_json::from_str(json).expect("old profiles still load");
+            assert_eq!(cfg.tls_root_certs_pem, None);
+        }
     }
 
     // ---- 1. Connect & disconnect -----------------------------------------

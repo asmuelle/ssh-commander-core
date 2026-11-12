@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '23 3 * * 1'
 
+# Read-only token for every job: nothing here pushes, comments or uploads.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
