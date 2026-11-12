@@ -1,6 +1,6 @@
 use crate::file_entry::RemoteFileEntry;
 use crate::transfer::TransferError;
-use russh::keys::{HashAlg, PublicKeyBase64};
+use russh::keys::{HashAlg, PublicKeyBase64, PublicKeyOrCertificate};
 use russh::*;
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
@@ -377,13 +377,7 @@ pub(crate) async fn connect_authenticated(
     host_keys: Arc<HostKeyStore>,
 ) -> Result<client::Handle<Client>, SshError> {
     let ssh_config = client::Config {
-        preferred: russh::Preferred {
-            // Cow::Borrowed is required in russh 0.61 — the fields changed from
-            // raw slices to Cow<'static, [...]>.
-            key: std::borrow::Cow::Borrowed(PREFERRED_HOST_KEY_ALGOS),
-            kex: std::borrow::Cow::Borrowed(PREFERRED_KEX_ALGOS),
-            ..russh::Preferred::DEFAULT
-        },
+        preferred: client_preferred(),
         keepalive_interval: Some(Duration::from_secs(60)),
         keepalive_max: 3,
         ..client::Config::default()
@@ -1430,6 +1424,68 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
         // russh 0.61: PrivateKey uses algorithm() → Algorithm instead of name() → &str.
         // Algorithm implements Display, producing the wire-format algorithm name.
         assert_eq!(key.algorithm().to_string(), "ssh-ed25519");
+    }
+}
+
+#[cfg(test)]
+mod host_key_policy_tests {
+    use super::{PREFERRED_HOST_KEY_ALGOS, client_preferred, plain_host_key};
+    use russh::keys::{Certificate, PrivateKey, PublicKeyOrCertificate, ssh_key};
+    use ssh_key::certificate::{Builder, CertType};
+
+    // Throwaway ed25519 key used only to sign a test certificate.
+    const TEST_KEY: &str = "\
+-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
+    fn test_key() -> PrivateKey {
+        PrivateKey::from_openssh(TEST_KEY).expect("test key parses")
+    }
+
+    fn test_certificate(key: &PrivateKey) -> Certificate {
+        let mut builder = Builder::new(vec![0u8; 32], key.public_key(), 0, u64::MAX)
+            .expect("certificate builder");
+        builder
+            .cert_type(CertType::Host)
+            .expect("host certificate type")
+            .valid_principal("host.example.test")
+            .expect("principal");
+        builder.sign(key).expect("certificate signs")
+    }
+
+    #[test]
+    fn plain_public_key_is_passed_through_to_the_host_key_store() {
+        let key = test_key();
+        let presented = PublicKeyOrCertificate::PublicKey {
+            key: key.public_key().clone(),
+            hash_alg: None,
+        };
+        assert_eq!(plain_host_key(&presented), Some(key.public_key()));
+    }
+
+    #[test]
+    fn host_certificate_is_never_treated_as_a_trusted_key() {
+        let key = test_key();
+        let presented = PublicKeyOrCertificate::Certificate(test_certificate(&key));
+        assert!(
+            plain_host_key(&presented).is_none(),
+            "a host certificate must not reach the TOFU host-key store"
+        );
+    }
+
+    #[test]
+    fn client_does_not_advertise_certificate_host_key_algorithms() {
+        let preferred = client_preferred();
+        assert!(
+            preferred.host_key_certificates.is_empty(),
+            "advertising certificates makes servers present ones we cannot verify"
+        );
+        assert_eq!(&*preferred.key, PREFERRED_HOST_KEY_ALGOS);
     }
 }
 
