@@ -4,6 +4,7 @@ use russh::keys::{HashAlg, PublicKeyBase64};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 /// Result of verifying a server-offered host key against the local store.
@@ -231,7 +232,12 @@ impl HostKeyStore {
             .file_name()
             .map(|n| n.to_os_string())
             .unwrap_or_else(|| "known_hosts".into());
-        name.push(format!(".tmp-{}", std::process::id()));
+        // Unique per write, not just per process: several stores in one
+        // process may point at the same file, and a shared temp name would
+        // let one writer rename the other's file out from under it.
+        static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        name.push(format!(".tmp-{}-{seq}", std::process::id()));
         self.path.with_file_name(name)
     }
 }
@@ -338,6 +344,35 @@ mod tests {
             reloaded.verify("host", 22, &key).await.expect("verify"),
             Verdict::Known
         ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_from_separate_stores_on_one_path_succeed() {
+        let dir = TempDir::new().expect("tmpdir");
+        let path = dir.path().join("known_hosts");
+        let stores: Vec<HostKeyStore> = (0..8).map(|_| HostKeyStore::new(path.clone())).collect();
+        let key = test_public_key();
+
+        let results = futures::future::join_all(
+            stores
+                .iter()
+                .enumerate()
+                .map(|(i, store)| store.trust("host", 2200 + i as u16, &key)),
+        )
+        .await;
+
+        for result in results {
+            result.expect("each concurrent trust must persist");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .filter(|n| n != "known_hosts")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[cfg(unix)]
