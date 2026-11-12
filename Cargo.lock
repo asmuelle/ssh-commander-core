@@ -119,7 +119,7 @@ dependencies = [
  "ahash",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 59.3.2",
  "chrono",
  "half",
  "hashbrown 0.17.1",
@@ -147,7 +147,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb0a031c7ff5e2bdb443117054fb466af1d4df5b7f0ecbe197713dc8b113b1ba"
 dependencies = [
  "arrow-buffer",
- "arrow-schema",
+ "arrow-schema 59.3.2",
  "half",
  "num-integer",
  "num-traits",
@@ -162,7 +162,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 59.3.2",
  "arrow-select",
  "flatbuffers",
 ]
@@ -174,6 +174,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e87acb0c6bf6237fca7a50d7b51e801c98a18a5fe6f3bb34f7d77b85ca165388"
 
 [[package]]
+name = "arrow-schema"
+version = "60.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de2c8e714b466404cdc1189e89f892426efea614d938e16c15518c340cd43ba3"
+
+[[package]]
 name = "arrow-select"
 version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -183,7 +189,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-data",
- "arrow-schema",
+ "arrow-schema 59.3.2",
  "num-traits",
 ]
 
@@ -1791,7 +1797,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-data",
  "arrow-ipc",
- "arrow-schema",
+ "arrow-schema 59.3.2",
  "arrow-select",
  "base64 0.23.1",
  "brotli",
@@ -2786,7 +2792,7 @@ name = "ssh-commander-pg-parquet"
 version = "0.3.0"
 dependencies = [
  "arrow-array",
- "arrow-schema",
+ "arrow-schema 60.1.0",
  "parquet",
  "tempfile",
  "thiserror 2.0.21",
