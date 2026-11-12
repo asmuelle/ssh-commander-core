@@ -9,8 +9,8 @@ are released together under one version number.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.3.x   | :white_check_mark: |
-| < 0.3   | :x:                |
+| 0.4.x   | :white_check_mark: |
+| < 0.4   | :x:                |
 
 While the crates are pre-1.0, a fix may arrive in a new minor version when
 the fix itself has to change behavior or API (for example, a safer default).
