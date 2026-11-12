@@ -26,6 +26,7 @@ fn pg_config() -> Option<PgConfig> {
         idle_timeout_secs: Some(1),
         min_idle_connections: Some(0),
         tls_root_certs_pem: None,
+        hostaddr: None,
     })
 }
 
@@ -85,6 +86,59 @@ async fn verify_full_accepts_a_private_ca_only_when_it_is_supplied() {
         .await
         .expect("query over verified TLS");
     assert_eq!(out.rows[0][0].as_deref(), Some("t"));
+}
+
+/// Tunnel shape: dial `hostaddr` but verify the certificate against `host`.
+/// Needs the TLS tier above plus `PG_TEST_TLS_SERVER_NAME`, a DNS name in
+/// the server certificate that need not resolve. Skipped otherwise.
+#[tokio::test]
+async fn verify_full_checks_host_name_while_dialing_hostaddr() {
+    let Some(base) = pg_config() else {
+        return;
+    };
+    let (Ok(root_path), Ok(server_name)) = (
+        env::var("PG_TEST_TLS_ROOT_PEM"),
+        env::var("PG_TEST_TLS_SERVER_NAME"),
+    ) else {
+        eprintln!("SKIP: PG_TEST_TLS_ROOT_PEM or PG_TEST_TLS_SERVER_NAME not set");
+        return;
+    };
+    let root = std::fs::read_to_string(root_path).expect("read PG_TEST_TLS_ROOT_PEM");
+    let addr: std::net::IpAddr = tokio::net::lookup_host((base.host.as_str(), base.port))
+        .await
+        .expect("resolve PG_TEST_HOST")
+        .next()
+        .expect("PG_TEST_HOST has an address")
+        .ip();
+    let dial_as = |name: &str| PgConfig {
+        host: name.to_string(),
+        hostaddr: Some(addr),
+        tls: PgTlsMode::default(),
+        tls_root_certs_pem: Some(root.clone()),
+        ..base.clone()
+    };
+
+    let pool = PgPool::connect(dial_as(&server_name))
+        .await
+        .expect("certificate matches `host` even though `hostaddr` was dialed");
+    let out = pool
+        .execute(
+            "tls",
+            "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+            1,
+        )
+        .await
+        .expect("query over verified TLS");
+    assert_eq!(out.rows[0][0].as_deref(), Some("t"));
+
+    let err = PgPool::connect(dial_as("not-in-the-certificate.invalid"))
+        .await
+        .err()
+        .expect("a name the certificate does not cover must be rejected");
+    assert!(
+        matches!(err, ssh_commander_pg::PgError::Tls(_)),
+        "a name mismatch is a TLS error: {err:?}"
+    );
 }
 
 async fn pool() -> Option<std::sync::Arc<PgPool>> {

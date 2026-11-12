@@ -804,9 +804,7 @@ impl ConnectionManager {
                 .map_err(|e| {
                     anyhow::Error::from(ssh_commander_pg::PgError::Tunnel(e.to_string()))
                 })?;
-            // Redirect the pool at the local end of the forward.
-            config.host = "127.0.0.1".to_string();
-            config.port = opened.local_port();
+            config = tunneled_pg_config(config, &t.remote_host, opened.local_port());
             Some(Arc::new(opened))
         } else {
             None
@@ -925,12 +923,52 @@ async fn resolve_pg_credentials(config: PgConfig) -> Result<PgConfig> {
     })
 }
 
+/// Point a Postgres profile at the local end of an SSH tunnel.
+///
+/// The pool dials the loopback forward (`hostaddr` + local port), but
+/// `host` becomes the tunnel's remote host, so under
+/// [`PgTlsMode::VerifyFull`](ssh_commander_pg::PgTlsMode::VerifyFull) the
+/// server certificate is checked against the real database host instead of
+/// `127.0.0.1`.
+#[cfg(all(feature = "postgres", feature = "ssh"))]
+fn tunneled_pg_config(config: PgConfig, remote_host: &str, local_port: u16) -> PgConfig {
+    PgConfig {
+        host: remote_host.to_string(),
+        hostaddr: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        port: local_port,
+        ..config
+    }
+}
+
 // =============================================================================
 // Unit tests
 // =============================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "postgres", feature = "ssh"))]
+    #[test]
+    fn tunneled_pg_config_dials_loopback_but_verifies_remote_host() {
+        let profile = PgConfig {
+            host: "bastion-facing-name.example".to_string(),
+            port: 5432,
+            tls: ssh_commander_pg::PgTlsMode::VerifyFull,
+            ..PgConfig::local("app", "svc")
+        };
+
+        let tunneled = tunneled_pg_config(profile.clone(), "db.internal.example", 41234);
+
+        assert_eq!(tunneled.host, "db.internal.example");
+        assert_eq!(
+            tunneled.hostaddr,
+            Some(std::net::IpAddr::from([127, 0, 0, 1]))
+        );
+        assert_eq!(tunneled.port, 41234);
+        assert_eq!(tunneled.tls, profile.tls);
+        assert_eq!(tunneled.database, profile.database);
+        assert_eq!(tunneled.user, profile.user);
+    }
     #[cfg(all(feature = "desktop", feature = "ssh"))]
     use async_trait::async_trait;
 

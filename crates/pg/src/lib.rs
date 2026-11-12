@@ -914,6 +914,9 @@ fn build_tls_connector(cfg: &PgConfig) -> Result<TlsConnectorKind, PgError> {
 fn build_driver_config(cfg: &PgConfig) -> Result<PgDriverConfig, PgError> {
     let mut driver = PgDriverConfig::new();
     driver.host(&cfg.host).port(cfg.port);
+    if let Some(addr) = cfg.hostaddr {
+        driver.hostaddr(addr);
+    }
     driver.dbname(&cfg.database).user(&cfg.user);
 
     let password = match &cfg.auth {
@@ -1123,6 +1126,36 @@ mod tests {
         cfg.tls = PgTlsMode::Disable;
         let driver = build_driver_config(&cfg).expect("driver cfg");
         assert!(matches!(driver.get_ssl_mode(), PgSslMode::Disable));
+    }
+
+    #[test]
+    fn driver_config_requires_tls_by_default() {
+        let cfg = PgConfig {
+            tls: PgTlsMode::default(),
+            ..PgConfig::local("db", "u")
+        };
+        let driver = build_driver_config(&cfg).expect("driver cfg");
+        assert!(matches!(driver.get_ssl_mode(), PgSslMode::Require));
+    }
+
+    #[test]
+    fn driver_config_dials_hostaddr_but_verifies_against_host() {
+        let cfg = PgConfig {
+            host: "db.internal.example".to_string(),
+            hostaddr: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            ..PgConfig::local("db", "u")
+        };
+        let driver = build_driver_config(&cfg).expect("driver cfg");
+        // tokio-postgres dials the hostaddr and hands `host` to the TLS
+        // connector as the name the certificate must match.
+        assert!(matches!(
+            driver.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(h)] if h == "db.internal.example"
+        ));
+        assert_eq!(
+            driver.get_hostaddrs(),
+            &[std::net::IpAddr::from([127, 0, 0, 1])]
+        );
     }
 
     #[test]
