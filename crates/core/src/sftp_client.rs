@@ -15,6 +15,11 @@ pub struct SftpConfig {
     pub port: u16,
     pub username: String,
     pub auth_method: SftpAuthMethod,
+    /// Also offer SHA-1 algorithms; see
+    /// [`SshConfig::allow_legacy_algorithms`](crate::ssh::SshConfig::allow_legacy_algorithms).
+    /// Off by default.
+    #[serde(default)]
+    pub allow_legacy_algorithms: bool,
 }
 
 impl std::fmt::Debug for SftpConfig {
@@ -24,6 +29,7 @@ impl std::fmt::Debug for SftpConfig {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("auth_method", &self.auth_method)
+            .field("allow_legacy_algorithms", &self.allow_legacy_algorithms)
             .finish()
     }
 }
@@ -101,6 +107,7 @@ impl StandaloneSftpClient {
             auth,
             Duration::from_secs(10),
             host_keys,
+            config.allow_legacy_algorithms,
         )
         .await?;
         let session = Arc::new(ssh_session);
@@ -223,6 +230,17 @@ mod tests {
             SftpAuthMethod::Password { password } => assert_eq!(password, "secret"),
             _ => panic!("Expected Password auth method"),
         }
+    }
+
+    #[test]
+    fn legacy_algorithms_are_off_unless_requested() {
+        let json = r#"{"host":"h","port":22,"username":"u","auth_method":{"type":"Password","password":"p"}}"#;
+        let config: SftpConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.allow_legacy_algorithms);
+
+        let json = r#"{"host":"h","port":22,"username":"u","auth_method":{"type":"Password","password":"p"},"allow_legacy_algorithms":true}"#;
+        let config: SftpConfig = serde_json::from_str(json).unwrap();
+        assert!(config.allow_legacy_algorithms);
     }
 
     #[test]

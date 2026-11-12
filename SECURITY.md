@@ -70,6 +70,9 @@ Out of scope:
 
 - SSH host keys are trusted on first use and pinned. A changed key refuses
   the connection, and host certificates are refused.
+- SSH offers no SHA-1 algorithms by default: no SHA-1 Diffie-Hellman key
+  exchange, no `ssh-rsa` host keys or RSA signatures, and no `hmac-sha1`.
+  `allow_legacy_algorithms` adds them for servers that need them.
 - PostgreSQL connections default to `VerifyFull`: TLS is required and the
   server certificate is checked against the system roots, plus any extra CA
   the profile supplies.
