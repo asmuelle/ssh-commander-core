@@ -59,9 +59,10 @@ Out of scope:
 - A vulnerability in a dependency that this project doesn't make worse.
   Report it to that dependency upstream. Known advisories are tracked in CI
   with `cargo audit` and `cargo deny`, and are fixed by upgrading.
-- Behavior a caller explicitly opts into, such as plain FTP, accepting
-  invalid FTPS certificates, or PostgreSQL TLS modes weaker than
-  `VerifyFull`. Each of these is documented as unverified.
+- Behavior a caller explicitly opts into, such as plain FTP or PostgreSQL
+  TLS modes weaker than `VerifyFull`. Each of these is documented as
+  unverified. FTPS always validates certificates; a self-signed or
+  private-CA server is trusted by adding its certificate.
 - The applications built on these crates. Report those to their own
   maintainers.
 

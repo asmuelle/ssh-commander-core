@@ -59,4 +59,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 proptest = "1"
+# Generates throwaway CA/server certificates for the FTPS trust tests.
+rcgen = "0.14.10"
+# The FTPS trust tests run an in-process TLS server; same native-tls that
+# suppaftp already links.
+native-tls = "0.2"
 tempfile = "3"
