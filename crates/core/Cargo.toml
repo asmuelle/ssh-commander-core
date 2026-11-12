@@ -47,14 +47,14 @@ serde_json = "1"
 tokio = { version = "1.53.3", features = ["full"] }
 async-trait = "0.1"
 russh = { version = "0.65.1", optional = true }
-russh-sftp = { version = "2", optional = true }
+russh-sftp = { version = "3.0.1", optional = true }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tokio-util = "0.7"
 futures = "0.3"
-suppaftp = { version = "10.0.2", features = ["tokio-async-native-tls"], optional = true }
-dirs = "5"
+suppaftp = { version = "12.2.1", features = ["tokio-async-native-tls"], optional = true }
+dirs = "7"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
