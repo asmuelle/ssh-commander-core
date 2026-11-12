@@ -39,6 +39,23 @@ pub enum SshError {
     #[error("{message}")]
     KeyLoad { message: String },
 
+    /// Negotiation failed because the server offers only SHA-1 algorithms,
+    /// which are off by default. `algorithms` lists the ones the server
+    /// offered that [`SshConfig::allow_legacy_algorithms`] would accept.
+    ///
+    /// [`SshConfig::allow_legacy_algorithms`]: crate::ssh::SshConfig::allow_legacy_algorithms
+    #[error(
+        "The SSH server at {host}:{port} only offers legacy SHA-1 algorithms ({}), which are \
+         off by default. Connect with allow_legacy_algorithms enabled if you trust this \
+         server and network.",
+        algorithms.join(", ")
+    )]
+    LegacyAlgorithmsRequired {
+        host: String,
+        port: u16,
+        algorithms: Vec<String>,
+    },
+
     #[error("Not connected")]
     NotConnected,
 
@@ -76,6 +93,22 @@ mod tests {
         assert!(rendered.contains("Host key verification failed for example.com:22"));
         assert!(rendered.contains("SHA256:AAAA"));
         assert!(rendered.contains("SHA256:BBBB"));
+    }
+
+    #[test]
+    fn legacy_algorithms_error_names_the_opt_in() {
+        let err = SshError::LegacyAlgorithmsRequired {
+            host: "old.example".into(),
+            port: 2222,
+            algorithms: vec!["diffie-hellman-group1-sha1".into()],
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("old.example:2222"), "{rendered}");
+        assert!(
+            rendered.contains("diffie-hellman-group1-sha1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("allow_legacy_algorithms"), "{rendered}");
     }
 
     #[test]

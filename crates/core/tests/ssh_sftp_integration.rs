@@ -32,6 +32,7 @@ fn ssh_config() -> Option<SshConfig> {
         port,
         username,
         auth_method,
+        allow_legacy_algorithms: env::var("SSH_TEST_ALLOW_LEGACY_ALGORITHMS").is_ok(),
     })
 }
 
@@ -82,6 +83,7 @@ async fn sftp_crud_smoke() {
             },
             _ => unreachable!("test helper only creates password or key auth"),
         },
+        allow_legacy_algorithms: ssh.allow_legacy_algorithms,
     };
     let mut client = StandaloneSftpClient::connect(&cfg, host_keys())
         .await
@@ -168,6 +170,7 @@ async fn ssh_exec_with_rsa_key() {
             key_path,
             passphrase: env::var("SSH_TEST_KEY_PASSPHRASE").ok(),
         },
+        allow_legacy_algorithms: env::var("SSH_TEST_ALLOW_LEGACY_ALGORITHMS").is_ok(),
     };
 
     let mut client = SshClient::new(host_keys());
@@ -181,5 +184,51 @@ async fn ssh_exec_with_rsa_key() {
         .expect("exec command");
     assert!(out.is_success(), "{out:?}");
     assert_eq!(out.stdout, "rsa-ok");
+    client.disconnect().await.expect("disconnect ssh");
+}
+
+/// Against a server that offers only SHA-1 algorithms, the default connect
+/// fails with `LegacyAlgorithmsRequired` naming them, and the opt-in connects.
+/// Set SSH_TEST_LEGACY_ONLY (plus the usual SSH_TEST_* variables) to run.
+#[tokio::test]
+async fn legacy_only_server_needs_opt_in() {
+    if env::var("SSH_TEST_LEGACY_ONLY").is_err() {
+        eprintln!("SKIP: SSH_TEST_LEGACY_ONLY not set");
+        return;
+    }
+    let Some(base) = ssh_config() else {
+        eprintln!("SKIP: SSH_TEST_HOST not set");
+        return;
+    };
+
+    let modern_only = SshConfig {
+        allow_legacy_algorithms: false,
+        ..base.clone()
+    };
+    let err = SshClient::new(host_keys())
+        .connect(&modern_only)
+        .await
+        .expect_err("a legacy-only server must not negotiate by default");
+    match &err {
+        ssh_commander_core::ssh::SshError::LegacyAlgorithmsRequired { algorithms, .. } => {
+            assert!(!algorithms.is_empty(), "{err}");
+        }
+        other => panic!("expected LegacyAlgorithmsRequired, got {other:?}"),
+    }
+
+    let opted_in = SshConfig {
+        allow_legacy_algorithms: true,
+        ..base
+    };
+    let mut client = SshClient::new(host_keys());
+    client
+        .connect(&opted_in)
+        .await
+        .expect("the opt-in reaches a legacy-only server");
+    let out = client
+        .execute_command_full("printf 'legacy-ok'")
+        .await
+        .expect("exec command");
+    assert_eq!(out.stdout, "legacy-ok");
     client.disconnect().await.expect("disconnect ssh");
 }

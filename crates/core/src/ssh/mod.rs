@@ -30,14 +30,11 @@ pub use tunnel::{SshTunnel, SshTunnelRef};
 /// pipelining anyway.
 pub const SFTP_CHUNK_SIZE: usize = crate::file_entry::FILE_TRANSFER_CHUNK_SIZE;
 
-/// Preferred host-key algorithms advertised to the server, ordered from most to
-/// least preferred.  RSA variants (including the legacy `ssh-rsa` / SHA-1) are
-/// included so that older servers that only offer RSA host keys are still
-/// reachable.
+/// Host-key algorithms offered to the server by default, most preferred first.
 ///
-/// In russh 0.61, host-key algorithms are represented as `ssh_key::Algorithm`
-/// (re-exported at `russh::keys::Algorithm`) instead of the old `key::Name` constants.
-pub(crate) static PREFERRED_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
+/// Host-key algorithms are `ssh_key::Algorithm` values, re-exported as
+/// `russh::keys::Algorithm`.
+pub(crate) static MODERN_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
     russh::keys::Algorithm::Ed25519,
     russh::keys::Algorithm::Ecdsa {
         curve: russh::keys::EcdsaCurve::NistP256,
@@ -51,29 +48,67 @@ pub(crate) static PREFERRED_HOST_KEY_ALGOS: &[russh::keys::Algorithm] = &[
     russh::keys::Algorithm::Rsa {
         hash: Some(russh::keys::HashAlg::Sha512),
     },
-    // Legacy ssh-rsa (SHA-1) for very old servers that advertise no modern RSA variant.
-    russh::keys::Algorithm::Rsa { hash: None },
 ];
 
-/// Key-exchange algorithms offered to the server, most-preferred first.
-///
-/// russh's built-in DEFAULT only includes the post-2020 KEX methods (curve25519,
-/// dh-group14-sha256, dh-group16-sha512). Many enterprise / managed SFTP
-/// endpoints still require the SHA-1 variants and drop the TCP connection with
-/// "Connection reset by peer" during KEX if we don't offer them. Keeping the
-/// modern entries first means security-conscious servers still negotiate up.
-pub(crate) static PREFERRED_KEX_ALGOS: &[russh::kex::Name] = &[
+/// `ssh-rsa` host keys, i.e. RSA signatures over SHA-1. Offered only with
+/// [`SshConfig::allow_legacy_algorithms`].
+static LEGACY_HOST_KEY_ALGOS: &[russh::keys::Algorithm] =
+    &[russh::keys::Algorithm::Rsa { hash: None }];
+
+/// Key-exchange algorithms offered by default, most preferred first.
+static MODERN_KEX_ALGOS: &[russh::kex::Name] = &[
     russh::kex::CURVE25519,
     russh::kex::CURVE25519_PRE_RFC_8731,
     russh::kex::DH_G16_SHA512,
     russh::kex::DH_G14_SHA256,
-    russh::kex::DH_G14_SHA1,
-    russh::kex::DH_G1_SHA1,
-    // Extension-negotiation markers — must remain in the offer list for
-    // strict-KEX and ext-info compatibility with modern servers.
+];
+
+/// SHA-1 Diffie-Hellman key exchange (group14 and the 1024-bit group1).
+/// Some older enterprise or managed SFTP endpoints still require these.
+/// Offered only with [`SshConfig::allow_legacy_algorithms`].
+static LEGACY_KEX_ALGOS: &[russh::kex::Name] = &[russh::kex::DH_G14_SHA1, russh::kex::DH_G1_SHA1];
+
+/// Extension-negotiation markers. They must stay in the key-exchange offer
+/// for ext-info and OpenSSH strict-KEX support.
+static KEX_EXTENSION_MARKERS: &[russh::kex::Name] = &[
     russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
     russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
 ];
+
+/// HMAC-SHA1. russh's default MAC list already leaves it out. Offered only
+/// with [`SshConfig::allow_legacy_algorithms`], since servers old enough to
+/// need SHA-1 key exchange often offer nothing newer.
+static LEGACY_MAC_ALGOS: &[russh::mac::Name] = &[russh::mac::HMAC_SHA1_ETM, russh::mac::HMAC_SHA1];
+
+/// Signature hashes tried for client RSA key authentication, in order.
+/// SHA-1 (`None`, i.e. `ssh-rsa`) comes last and only with the opt-in.
+fn rsa_signature_hashes(allow_legacy: bool) -> &'static [Option<HashAlg>] {
+    if allow_legacy {
+        &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+    } else {
+        &[Some(HashAlg::Sha512), Some(HashAlg::Sha256)]
+    }
+}
+
+/// The legacy algorithms in a server's offer that this client would accept
+/// with [`SshConfig::allow_legacy_algorithms`]. Used to explain a failed
+/// negotiation: an empty result means the opt-in would not help.
+fn legacy_algorithms_offered_by_server(
+    kind: &russh::AlgorithmKind,
+    theirs: &[String],
+) -> Vec<String> {
+    let legacy: Vec<&str> = match kind {
+        russh::AlgorithmKind::Kex => LEGACY_KEX_ALGOS.iter().map(|n| n.as_ref()).collect(),
+        russh::AlgorithmKind::Key => LEGACY_HOST_KEY_ALGOS.iter().map(|a| a.as_str()).collect(),
+        russh::AlgorithmKind::Mac => LEGACY_MAC_ALGOS.iter().map(|n| n.as_ref()).collect(),
+        _ => Vec::new(),
+    };
+    theirs
+        .iter()
+        .filter(|name| legacy.contains(&name.as_str()))
+        .cloned()
+        .collect()
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SshConfig {
@@ -81,6 +116,17 @@ pub struct SshConfig {
     pub port: u16,
     pub username: String,
     pub auth_method: AuthMethod,
+    /// Also offer SHA-1 algorithms: `diffie-hellman-group14-sha1` and
+    /// `diffie-hellman-group1-sha1` key exchange, `ssh-rsa` host keys,
+    /// `hmac-sha1` MACs, and SHA-1 signatures for RSA key authentication.
+    ///
+    /// Off by default. Turn it on only for a server that can't negotiate
+    /// anything newer; a connect to such a server fails with
+    /// [`SshError::LegacyAlgorithmsRequired`] naming what it offered. The
+    /// legacy algorithms are offered after every modern one, so a server that
+    /// supports both still negotiates a modern algorithm.
+    #[serde(default)]
+    pub allow_legacy_algorithms: bool,
 }
 
 impl std::fmt::Debug for SshConfig {
@@ -90,6 +136,7 @@ impl std::fmt::Debug for SshConfig {
             .field("port", &self.port)
             .field("username", &self.username)
             .field("auth_method", &self.auth_method)
+            .field("allow_legacy_algorithms", &self.allow_legacy_algorithms)
             .finish()
     }
 }
@@ -256,16 +303,42 @@ fn plain_host_key(presented: &PublicKeyOrCertificate) -> Option<&russh::keys::Pu
 
 /// Algorithm preferences offered to the server.
 ///
+/// Without `allow_legacy` no SHA-1 algorithm is offered. With it, the legacy
+/// algorithms are appended after every modern one.
+///
 /// `host_key_certificates` is deliberately left at russh's empty default: it
 /// makes a server present a certificate instead of a bare key, which this
 /// client cannot verify (see [`plain_host_key`]).
-fn client_preferred() -> russh::Preferred {
+fn client_preferred(allow_legacy: bool) -> russh::Preferred {
+    use std::borrow::Cow;
+
+    let legacy_kex: &[russh::kex::Name] = if allow_legacy { LEGACY_KEX_ALGOS } else { &[] };
+    let legacy_keys: &[russh::keys::Algorithm] = if allow_legacy {
+        LEGACY_HOST_KEY_ALGOS
+    } else {
+        &[]
+    };
+    let legacy_macs: &[russh::mac::Name] = if allow_legacy { LEGACY_MAC_ALGOS } else { &[] };
+
+    let defaults = russh::Preferred::DEFAULT;
     russh::Preferred {
-        // Cow::Borrowed is required since russh 0.61 — the fields changed from
-        // raw slices to Cow<'static, [...]>.
-        key: std::borrow::Cow::Borrowed(PREFERRED_HOST_KEY_ALGOS),
-        kex: std::borrow::Cow::Borrowed(PREFERRED_KEX_ALGOS),
-        ..russh::Preferred::DEFAULT
+        key: Cow::Owned(
+            MODERN_HOST_KEY_ALGOS
+                .iter()
+                .chain(legacy_keys)
+                .cloned()
+                .collect(),
+        ),
+        kex: Cow::Owned(
+            MODERN_KEX_ALGOS
+                .iter()
+                .chain(legacy_kex)
+                .chain(KEX_EXTENSION_MARKERS)
+                .copied()
+                .collect(),
+        ),
+        mac: Cow::Owned(defaults.mac.iter().chain(legacy_macs).copied().collect()),
+        ..defaults
     }
 }
 
@@ -402,9 +475,10 @@ pub(crate) async fn connect_authenticated(
     auth: ResolvedAuth<'_>,
     timeout: Duration,
     host_keys: Arc<HostKeyStore>,
+    allow_legacy_algorithms: bool,
 ) -> Result<client::Handle<Client>, SshError> {
     let ssh_config = client::Config {
-        preferred: client_preferred(),
+        preferred: client_preferred(allow_legacy_algorithms),
         keepalive_interval: Some(Duration::from_secs(60)),
         keepalive_max: 3,
         ..client::Config::default()
@@ -425,6 +499,19 @@ pub(crate) async fn connect_authenticated(
             && let Some(failure) = guard.take()
         {
             return SshError::HostKeyVerification(failure);
+        }
+
+        // A server that only speaks legacy algorithms: name them and point
+        // at the opt-in instead of surfacing russh's raw negotiation dump.
+        if !allow_legacy_algorithms && let russh::Error::NoCommonAlgo { kind, theirs, .. } = &e {
+            let algorithms = legacy_algorithms_offered_by_server(kind, theirs);
+            if !algorithms.is_empty() {
+                return SshError::LegacyAlgorithmsRequired {
+                    host: host.to_string(),
+                    port,
+                    algorithms,
+                };
+            }
         }
 
         // "Connection reset by peer" during the initial handshake almost
@@ -485,16 +572,15 @@ pub(crate) async fn connect_authenticated(
             })?
             .success(),
         ResolvedAuth::Key { key, .. } => {
-            // russh 0.61: authenticate_publickey takes PrivateKeyWithHashAlg
-            // instead of Arc<KeyPair>. For RSA keys, hash_alg = None makes russh
-            // sign with SHA-1 (ssh-rsa), which OpenSSH >= 8.8 rejects by default
-            // — so we must offer the SHA-2 variants. Try SHA-512, then SHA-256,
-            // then SHA-1 for legacy servers. Non-RSA keys ignore the hash alg, so
-            // a single None attempt uses their natural algorithm.
+            // authenticate_publickey takes a PrivateKeyWithHashAlg. For RSA
+            // keys, hash_alg = None signs with SHA-1 (ssh-rsa), which OpenSSH
+            // >= 8.8 rejects by default, so SHA-512 and SHA-256 are tried
+            // first and SHA-1 only with the legacy opt-in. Non-RSA keys ignore
+            // the hash alg, so a single None attempt uses their natural one.
             let key = Arc::new(*key);
             let hash_algs: &[Option<HashAlg>] =
                 if matches!(key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
-                    &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+                    rsa_signature_hashes(allow_legacy_algorithms)
                 } else {
                     &[None]
                 };
@@ -550,14 +636,29 @@ pub(crate) async fn connect_authenticated(
                 SshError::Auth { message }
             })?;
             // Extract the public key from the agent identity for authenticate_publickey_with.
+            // As with key files, an RSA identity signs with SHA-2 first; a
+            // `None` hash would ask the agent for an ssh-rsa (SHA-1) signature.
             let public_key = identity.public_key().into_owned();
-            session
-                .authenticate_publickey_with(username, public_key, None, &mut agent)
-                .await
-                .map_err(|e| SshError::Auth {
-                    message: format!("SSH agent authentication failed: {}", e),
-                })?
-                .success()
+            let hash_algs: &[Option<HashAlg>] =
+                if matches!(public_key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
+                    rsa_signature_hashes(allow_legacy_algorithms)
+                } else {
+                    &[None]
+                };
+            let mut authenticated = false;
+            for hash_alg in hash_algs.iter().copied() {
+                let auth = session
+                    .authenticate_publickey_with(username, public_key.clone(), hash_alg, &mut agent)
+                    .await
+                    .map_err(|e| SshError::Auth {
+                        message: format!("SSH agent authentication failed: {}", e),
+                    })?;
+                if auth.success() {
+                    authenticated = true;
+                    break;
+                }
+            }
+            authenticated
         }
     };
 
@@ -785,6 +886,7 @@ impl SshClient {
             auth,
             Duration::from_secs(10),
             self.host_keys.clone(),
+            config.allow_legacy_algorithms,
         )
         .await?;
 
@@ -1384,6 +1486,7 @@ mod redaction_tests {
             auth_method: AuthMethod::Password {
                 password: "super-secret-123".into(),
             },
+            allow_legacy_algorithms: false,
         };
         let rendered = format!("{:?}", cfg);
         assert!(
@@ -1456,7 +1559,7 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
 
 #[cfg(test)]
 mod host_key_policy_tests {
-    use super::{PREFERRED_HOST_KEY_ALGOS, client_preferred, plain_host_key};
+    use super::{MODERN_HOST_KEY_ALGOS, client_preferred, plain_host_key};
     use russh::keys::{Certificate, PrivateKey, PublicKeyOrCertificate, ssh_key};
     use ssh_key::certificate::{Builder, CertType};
 
@@ -1507,12 +1610,149 @@ ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
 
     #[test]
     fn client_does_not_advertise_certificate_host_key_algorithms() {
-        let preferred = client_preferred();
+        for allow_legacy in [false, true] {
+            let preferred = client_preferred(allow_legacy);
+            assert!(
+                preferred.host_key_certificates.is_empty(),
+                "advertising certificates makes servers present ones we cannot verify"
+            );
+        }
+        assert_eq!(&*client_preferred(false).key, MODERN_HOST_KEY_ALGOS);
+    }
+}
+
+#[cfg(test)]
+mod algorithm_policy_tests {
+    use super::{client_preferred, legacy_algorithms_offered_by_server, rsa_signature_hashes};
+    use russh::keys::{Algorithm, HashAlg};
+    use russh::{AlgorithmKind, kex, mac};
+
+    const SHA1_KEX: [kex::Name; 2] = [kex::DH_G14_SHA1, kex::DH_G1_SHA1];
+    const SHA1_MAC: [mac::Name; 2] = [mac::HMAC_SHA1_ETM, mac::HMAC_SHA1];
+    const SSH_RSA: Algorithm = Algorithm::Rsa { hash: None };
+
+    #[test]
+    fn default_offer_has_no_sha1_algorithms() {
+        let preferred = client_preferred(false);
+        for name in SHA1_KEX {
+            assert!(
+                !preferred.kex.contains(&name),
+                "{name:?} offered by default"
+            );
+        }
+        for name in SHA1_MAC {
+            assert!(
+                !preferred.mac.contains(&name),
+                "{name:?} offered by default"
+            );
+        }
         assert!(
-            preferred.host_key_certificates.is_empty(),
-            "advertising certificates makes servers present ones we cannot verify"
+            !preferred.key.contains(&SSH_RSA),
+            "ssh-rsa offered by default"
         );
-        assert_eq!(&*preferred.key, PREFERRED_HOST_KEY_ALGOS);
+        assert!(preferred.kex.contains(&kex::CURVE25519));
+        assert!(
+            preferred
+                .kex
+                .contains(&kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT)
+        );
+    }
+
+    #[test]
+    fn legacy_opt_in_adds_sha1_algorithms_after_every_modern_one() {
+        let modern = client_preferred(false);
+        let legacy = client_preferred(true);
+
+        for name in SHA1_KEX {
+            assert!(legacy.kex.contains(&name), "{name:?} missing with opt-in");
+        }
+        for name in SHA1_MAC {
+            assert!(legacy.mac.contains(&name), "{name:?} missing with opt-in");
+        }
+        assert!(legacy.key.contains(&SSH_RSA));
+
+        // Modern algorithms keep their order and all come first, so a server
+        // that supports both still negotiates a modern one.
+        assert_eq!(&legacy.key[..modern.key.len()], &*modern.key);
+        assert_eq!(&legacy.mac[..modern.mac.len()], &*modern.mac);
+        let first_legacy_kex = legacy
+            .kex
+            .iter()
+            .position(|n| SHA1_KEX.contains(n))
+            .expect("legacy kex present");
+        for name in modern.kex.iter() {
+            let at = legacy
+                .kex
+                .iter()
+                .position(|n| n == name)
+                .expect("modern kex kept");
+            // Extension markers aren't real algorithms; their position is free.
+            let is_marker = [
+                kex::EXTENSION_SUPPORT_AS_CLIENT,
+                kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+            ]
+            .contains(name);
+            if !is_marker {
+                assert!(at < first_legacy_kex, "{name:?} must precede SHA-1 kex");
+            }
+        }
+    }
+
+    #[test]
+    fn ssh_config_keeps_legacy_algorithms_off_unless_requested() {
+        let json = r#"{"host":"h","port":22,"username":"u","auth_method":{"type":"Password","password":"p"}}"#;
+        let config: super::SshConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(!config.allow_legacy_algorithms);
+    }
+
+    #[test]
+    fn rsa_client_signatures_use_sha1_only_with_opt_in() {
+        assert_eq!(
+            rsa_signature_hashes(false),
+            &[Some(HashAlg::Sha512), Some(HashAlg::Sha256)]
+        );
+        assert_eq!(
+            rsa_signature_hashes(true),
+            &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+        );
+    }
+
+    #[test]
+    fn server_offering_only_legacy_kex_is_reported() {
+        let theirs = vec![
+            "diffie-hellman-group14-sha1".to_string(),
+            "diffie-hellman-group1-sha1".to_string(),
+        ];
+        assert_eq!(
+            legacy_algorithms_offered_by_server(&AlgorithmKind::Kex, &theirs),
+            theirs
+        );
+    }
+
+    #[test]
+    fn server_offering_only_ssh_rsa_host_keys_is_reported() {
+        let theirs = vec!["ssh-rsa".to_string(), "ssh-dss".to_string()];
+        assert_eq!(
+            legacy_algorithms_offered_by_server(&AlgorithmKind::Key, &theirs),
+            vec!["ssh-rsa".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_offering_only_hmac_sha1_is_reported() {
+        let theirs = vec!["hmac-sha1".to_string(), "hmac-md5".to_string()];
+        assert_eq!(
+            legacy_algorithms_offered_by_server(&AlgorithmKind::Mac, &theirs),
+            vec!["hmac-sha1".to_string()]
+        );
+    }
+
+    #[test]
+    fn mismatch_unrelated_to_the_opt_in_is_not_reported() {
+        let ciphers = vec!["3des-cbc".to_string()];
+        assert!(legacy_algorithms_offered_by_server(&AlgorithmKind::Cipher, &ciphers).is_empty());
+        let dss_only = vec!["ssh-dss".to_string()];
+        assert!(legacy_algorithms_offered_by_server(&AlgorithmKind::Key, &dss_only).is_empty());
     }
 }
 

@@ -24,6 +24,7 @@ fn create_test_config() -> SshConfig {
         auth_method: AuthMethod::Password {
             password: TEST_PASSWORD.to_string(),
         },
+        allow_legacy_algorithms: false,
     }
 }
 
@@ -101,6 +102,7 @@ async fn test_invalid_credentials() {
         auth_method: AuthMethod::Password {
             password: "wrongpassword".to_string(),
         },
+        allow_legacy_algorithms: false,
     };
 
     let result = client_write.connect(&config).await;
