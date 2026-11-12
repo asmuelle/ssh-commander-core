@@ -240,25 +240,52 @@ impl Client {
     }
 }
 
-// russh 0.65 uses RPITIT (no async_trait needed for the Handler trait itself).
+/// The plain public key behind what the server presented, or `None` for a host
+/// certificate.
+///
+/// russh >= 0.65 hands `check_server_key` either a bare key or an OpenSSH host
+/// certificate. This client's host-key store only knows bare keys and has no
+/// notion of trusted certificate authorities, so a certificate cannot be
+/// verified and must be refused rather than trusted on first use.
+fn plain_host_key(presented: &PublicKeyOrCertificate) -> Option<&russh::keys::PublicKey> {
+    match presented {
+        PublicKeyOrCertificate::PublicKey { key, .. } => Some(key),
+        PublicKeyOrCertificate::Certificate(_) => None,
+    }
+}
+
+/// Algorithm preferences offered to the server.
+///
+/// `host_key_certificates` is deliberately left at russh's empty default: it
+/// makes a server present a certificate instead of a bare key, which this
+/// client cannot verify (see [`plain_host_key`]).
+fn client_preferred() -> russh::Preferred {
+    russh::Preferred {
+        // Cow::Borrowed is required since russh 0.61 — the fields changed from
+        // raw slices to Cow<'static, [...]>.
+        key: std::borrow::Cow::Borrowed(PREFERRED_HOST_KEY_ALGOS),
+        kex: std::borrow::Cow::Borrowed(PREFERRED_KEX_ALGOS),
+        ..russh::Preferred::DEFAULT
+    }
+}
+
+// russh uses RPITIT (no async_trait needed for the Handler trait itself).
 impl client::Handler for Client {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        server_key: &russh::keys::PublicKeyOrCertificate,
+        presented: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // There is no CA trust store, so a host certificate is handled like
-        // OpenSSH does without a matching `@cert-authority` entry: the host
-        // key embedded in the certificate goes through the same TOFU check
-        // against known_hosts as a plain key.
-        let certified_key;
-        let server_public_key = match server_key {
-            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
-            russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
-                certified_key = russh::keys::PublicKey::from(cert.public_key().clone());
-                &certified_key
-            }
+        let Some(server_public_key) = plain_host_key(presented) else {
+            // Not reachable while `client_preferred` advertises no certificate
+            // algorithms; kept as a fail-closed guard in case that changes.
+            tracing::error!(
+                "refusing host certificate from {}:{}: certificate authorities are not supported",
+                self.host,
+                self.port
+            );
+            return Ok(false);
         };
         match self
             .store
