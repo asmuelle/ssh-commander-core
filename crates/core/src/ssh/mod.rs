@@ -240,14 +240,26 @@ impl Client {
     }
 }
 
-// russh 0.61 uses RPITIT (no async_trait needed for the Handler trait itself).
+// russh 0.65 uses RPITIT (no async_trait needed for the Handler trait itself).
 impl client::Handler for Client {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        // There is no CA trust store, so a host certificate is handled like
+        // OpenSSH does without a matching `@cert-authority` entry: the host
+        // key embedded in the certificate goes through the same TOFU check
+        // against known_hosts as a plain key.
+        let certified_key;
+        let server_public_key = match server_key {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+                certified_key = russh::keys::PublicKey::from(cert.public_key().clone());
+                &certified_key
+            }
+        };
         match self
             .store
             .verify(&self.host, self.port, server_public_key)

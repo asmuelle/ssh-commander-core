@@ -75,12 +75,7 @@ impl TcpdumpRegistry {
         validate_interface(interface)?;
         validate_filter(filter)?;
 
-        let snap = snaplen.unwrap_or(96);
-        let cmd = if filter.trim().is_empty() {
-            format!("sudo -n tcpdump -lnn -s {snap} -i {interface}")
-        } else {
-            format!("sudo -n tcpdump -lnn -s {snap} -i {interface} '{filter}'")
-        };
+        let cmd = capture_command(snaplen.unwrap_or(96), interface, filter);
 
         let (mut rx, cancel) = client
             .execute_command_streaming(&cmd)
@@ -137,6 +132,21 @@ impl TcpdumpRegistry {
     }
 }
 
+/// Build the remote capture command. Callers must have run
+/// `validate_interface` and `validate_filter` first.
+///
+/// The `--` ends option parsing, so a filter that starts with `-` can't
+/// smuggle in tcpdump options such as `-z <cmd> -Z root`, which would run a
+/// command as root through `sudo`.
+fn capture_command(snaplen: u32, interface: &str, filter: &str) -> String {
+    let base = format!("sudo -n tcpdump -lnn -s {snaplen} -i {interface}");
+    if filter.trim().is_empty() {
+        base
+    } else {
+        format!("{base} -- '{filter}'")
+    }
+}
+
 fn validate_interface(iface: &str) -> Result<(), ToolsError> {
     if iface.is_empty()
         || iface.len() > 32
@@ -175,6 +185,26 @@ mod tests {
         assert!(validate_interface("eth0").is_ok());
         assert!(validate_interface("any").is_ok());
         assert!(validate_interface("en0:vlan100").is_ok());
+    }
+
+    #[test]
+    fn capture_command_ends_options_before_filter() {
+        assert_eq!(
+            capture_command(96, "eth0", "-z /tmp/x -Z root"),
+            "sudo -n tcpdump -lnn -s 96 -i eth0 -- '-z /tmp/x -Z root'"
+        );
+        assert_eq!(
+            capture_command(96, "any", "port 80"),
+            "sudo -n tcpdump -lnn -s 96 -i any -- 'port 80'"
+        );
+    }
+
+    #[test]
+    fn capture_command_without_filter_has_no_expression() {
+        assert_eq!(
+            capture_command(128, "any", "  "),
+            "sudo -n tcpdump -lnn -s 128 -i any"
+        );
     }
 
     #[test]
